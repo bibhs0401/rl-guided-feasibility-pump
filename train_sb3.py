@@ -12,7 +12,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("train_sb3")
-DEFAULT_INSTANCE_DIR = "1"
+DEFAULT_INSTANCE_DIR = os.path.join(os.path.expanduser("~"), "1")
 
 
 def parse_args():

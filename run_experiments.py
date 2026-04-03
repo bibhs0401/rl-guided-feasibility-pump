@@ -22,7 +22,7 @@ except ImportError:
     socp = None
 
 random.seed(10)
-DEFAULT_INSTANCE_DIR = "1"
+DEFAULT_INSTANCE_DIR = os.path.join(os.path.expanduser("~"), "1")
 
 logging.basicConfig(
     level=logging.INFO,
