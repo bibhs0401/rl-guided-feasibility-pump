@@ -55,6 +55,18 @@ def parse_args():
         action="store_true",
         help="Skip stable-baselines3 environment validation before training.",
     )
+    parser.add_argument(
+        "--max-train-seconds",
+        type=float,
+        default=None,
+        help="Optional wall-clock limit for the entire SB3 training run.",
+    )
+    parser.add_argument(
+        "--episode-time-limit",
+        type=float,
+        default=None,
+        help="Optional per-episode time cap in seconds inside the FP environment.",
+    )
     return parser.parse_args()
 
 
@@ -76,6 +88,8 @@ def main():
         top_k=args.top_k,
         seed=args.seed,
         check_environment=not args.skip_env_check,
+        max_train_seconds=args.max_train_seconds,
+        episode_time_limit=args.episode_time_limit,
     )
 
     logger.info("Finished training. Saved model to %s", args.model_path)

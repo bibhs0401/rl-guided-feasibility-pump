@@ -21,9 +21,11 @@ except ImportError:
 
 try:
     from stable_baselines3 import PPO
+    from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.env_checker import check_env
 except ImportError:
     PPO = None
+    BaseCallback = None
     check_env = None
 
 try:
@@ -211,6 +213,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         integer_bonus: float = 10.0,
         invalid_action_penalty: float = -0.25,
         failure_penalty: float = -5.0,
+        log_progress: bool = True,
+        episode_time_limit: Optional[float] = None,
     ):
         _require_gymnasium()
         _require_pandas()
@@ -225,6 +229,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.integer_bonus = integer_bonus
         self.invalid_action_penalty = invalid_action_penalty
         self.failure_penalty = failure_penalty
+        self.log_progress = log_progress
+        self.episode_time_limit = episode_time_limit
 
         obs_size = 6 + (3 * top_k)
         self.observation_space = spaces.Box(
@@ -245,6 +251,9 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.delta: Optional[float] = None
         self.last_reward = 0.0
         self.nIT = 0
+        self.episode_counter = 0
+        self.decision_counter = 0
+        self.episode_start_time = None
 
     def _select_instance(self, options: Optional[Dict[str, Any]]) -> str:
         if options and options.get("instance_path"):
@@ -265,6 +274,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.p = p
         self.I, self.not_I = base.get_integer_index(n)
         self.TL, self.T, self.TT, self.R = base.FP_parameters(self.I, m, n)
+        if self.episode_time_limit is not None:
+            self.TL = min(self.TL, float(self.episode_time_limit))
         self.m1, self.multiplicative_y_m1 = base.first_linear_model(A, b, c, d, n, p, self.I)
         self.f, self.objvar, self.z, self.multiplicative_y_f = base.second_model_FP(n, A, b, c, d, p, self.I)
 
@@ -278,6 +289,18 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.result_reason = reason
         self.current_candidates = []
         self.current_observation = self._terminal_observation()
+        if self.log_progress:
+            elapsed = 0.0 if self.episode_start_time is None else (time.time() - self.episode_start_time)
+            logger.info(
+                "Episode %s finished | reason=%s | nIT=%s | delta=%s | decisions=%s | elapsed=%.2fs | instance=%s",
+                self.episode_counter,
+                reason,
+                self.nIT,
+                self.delta,
+                self.decision_counter,
+                elapsed,
+                self.current_instance_path,
+            )
 
     def _solve_until_decision_or_stop(self):
         while (time.time() - self.fp_start_time) < self.TL:
@@ -328,6 +351,15 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
                 self.terminated = False
                 self.truncated = False
                 self.result_reason = "awaiting_action"
+                if self.log_progress:
+                    logger.info(
+                        "Episode %s awaiting action | nIT=%s | delta=%.6f | candidates=%s | instance=%s",
+                        self.episode_counter,
+                        self.nIT,
+                        self.delta,
+                        len(self.current_candidates),
+                        self.current_instance_path,
+                    )
                 return
 
             for j in self.I:
@@ -341,6 +373,7 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self._set_terminal("timeout")
 
     def _initialize_episode(self, instance_path: str):
+        self.episode_counter += 1
         self.current_instance_path = instance_path
         self.last_reward = 0.0
         self.awaiting_action = False
@@ -350,10 +383,22 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.current_candidates = []
         self.delta = None
         self.nIT = 0
+        self.decision_counter = 0
         self.solution_value = None
 
         self._load_instance(instance_path)
         self.fp_start_time = time.time()
+        self.episode_start_time = self.fp_start_time
+        if self.log_progress:
+            logger.info(
+                "Episode %s started | instance=%s | m=%s | n=%s | p=%s | TL=%.2fs",
+                self.episode_counter,
+                instance_path,
+                self.m,
+                self.n,
+                self.p,
+                self.TL,
+            )
 
         self.m1, self.z_lp, self.x_relaxed, self.y_values = base.solve_first_linear_model(self.m1, self.n)
         if self.y_values == "none":
@@ -411,6 +456,17 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
 
         previous_delta = self.delta
         chosen_variable = action_to_variable(action, self.current_candidates)
+        self.decision_counter += 1
+        if self.log_progress:
+            logger.info(
+                "Episode %s decision %s | action=%s | chosen_var=%s | prev_delta=%s | instance=%s",
+                self.episode_counter,
+                self.decision_counter,
+                action,
+                chosen_variable,
+                previous_delta,
+                self.current_instance_path,
+            )
         self.x_tilde = base.flip_one(self.x_tilde, chosen_variable)
         self.awaiting_action = False
         self.current_candidates = []
@@ -426,6 +482,15 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
             reward += self.failure_penalty
 
         self.last_reward = float(reward)
+        if self.log_progress:
+            logger.info(
+                "Episode %s post-step | reward=%.6f | delta=%s | reason=%s | nIT=%s",
+                self.episode_counter,
+                self.last_reward,
+                self.delta,
+                self.result_reason,
+                self.nIT,
+            )
         return self.current_observation.copy(), float(reward), self.terminated, self.truncated, self._info()
 
     def render(self):
@@ -449,6 +514,31 @@ def make_phase1_env(instance_files: Sequence[str], top_k: int = 10, use_masking:
     return env
 
 
+class WallClockLimitCallback(BaseCallback):
+    def __init__(self, max_seconds: Optional[float], verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self.max_seconds = max_seconds
+        self.start_time = None
+
+    def _on_training_start(self) -> None:
+        self.start_time = time.time()
+        if self.max_seconds is not None:
+            logger.info("Training wall-clock limit set to %.2fs", self.max_seconds)
+
+    def _on_step(self) -> bool:
+        if self.max_seconds is None or self.start_time is None:
+            return True
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.max_seconds:
+            logger.warning(
+                "Stopping training because wall-clock limit was reached | elapsed=%.2fs | limit=%.2fs",
+                elapsed,
+                self.max_seconds,
+            )
+            return False
+        return True
+
+
 def train_phase1_sb3_model(
     instance_files: Sequence[str],
     total_timesteps: int,
@@ -459,6 +549,8 @@ def train_phase1_sb3_model(
     seed: int = 10,
     check_environment: bool = True,
     verbose: int = 1,
+    max_train_seconds: Optional[float] = None,
+    episode_time_limit: Optional[float] = None,
     **model_kwargs,
 ):
     _require_gymnasium()
@@ -468,7 +560,22 @@ def train_phase1_sb3_model(
         logger.warning("sb3-contrib is not installed, falling back to plain PPO without action masking")
         use_masking = False
 
-    base_env = Phase1FeasibilityPumpEnv(instance_files, top_k=top_k)
+    logger.info(
+        "Starting SB3 training | instances=%s | timesteps=%s | use_masking=%s | top_k=%s | check_env=%s | max_train_seconds=%s | episode_time_limit=%s",
+        len(instance_files),
+        total_timesteps,
+        use_masking,
+        top_k,
+        check_environment,
+        max_train_seconds,
+        episode_time_limit,
+    )
+
+    base_env = Phase1FeasibilityPumpEnv(
+        instance_files,
+        top_k=top_k,
+        episode_time_limit=episode_time_limit,
+    )
     if check_environment and check_env is not None:
         check_env(base_env, warn=True)
 
@@ -479,7 +586,13 @@ def train_phase1_sb3_model(
     else:
         model = PPO(policy, train_env, verbose=verbose, seed=seed, **model_kwargs)
 
-    model.learn(total_timesteps=total_timesteps)
+    callback = None
+    if max_train_seconds is not None:
+        if BaseCallback is None:
+            raise ImportError("stable-baselines3 callback support is unavailable in this environment")
+        callback = WallClockLimitCallback(max_train_seconds, verbose=verbose)
+
+    model.learn(total_timesteps=total_timesteps, callback=callback)
 
     if model_path:
         model.save(model_path)
