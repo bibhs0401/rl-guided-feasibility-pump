@@ -1,4 +1,5 @@
 import argparse
+import csv
 import glob
 import logging
 import os
@@ -28,6 +29,11 @@ def parse_args():
         default=None,
         help="Glob pattern for CSV instance files. If provided, runs each match in order.",
     )
+    parser.add_argument(
+        "--output-file",
+        default="output_baseline.csv",
+        help="CSV file where baseline results will be saved.",
+    )
     return parser.parse_args()
 
 
@@ -37,22 +43,41 @@ def run_instance(instance_path: str):
     A, b, c, m, n, d, p = baseline.required_data(data)
     result = baseline.main_function(A, b, c, m, n, d, p)
     print(f"{instance_path}: {result}")
+    return result
 
 
 def main():
     args = parse_args()
 
-    if args.instance:
-        run_instance(args.instance)
-        return
+    with open(args.output_file, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([
+            "instance",
+            "decision_variables",
+            "y_values",
+            "objective_value",
+            "delta",
+            "solution_time",
+            "fp_iterations",
+            "cut_iterations",
+        ])
 
-    pattern = args.instances or os.path.join(DEFAULT_INSTANCE_DIR, "instance*.csv")
-    instance_files = sorted(glob.glob(pattern))
-    if not instance_files:
-        raise FileNotFoundError(f"No instance files matched pattern: {pattern}")
+        if args.instance:
+            result = run_instance(args.instance)
+            writer.writerow([args.instance, *result])
+            logger.info("Saved baseline result to %s", args.output_file)
+            return
 
-    for instance_path in instance_files:
-        run_instance(instance_path)
+        pattern = args.instances or os.path.join(DEFAULT_INSTANCE_DIR, "instance*.csv")
+        instance_files = sorted(glob.glob(pattern))
+        if not instance_files:
+            raise FileNotFoundError(f"No instance files matched pattern: {pattern}")
+
+        for instance_path in instance_files:
+            result = run_instance(instance_path)
+            writer.writerow([instance_path, *result])
+
+    logger.info("Saved baseline results to %s", args.output_file)
 
 
 if __name__ == "__main__":
