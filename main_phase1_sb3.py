@@ -543,6 +543,7 @@ def train_phase1_sb3_model(
     instance_files: Sequence[str],
     total_timesteps: int,
     model_path: Optional[str] = None,
+    load_model_path: Optional[str] = None,
     use_masking: bool = True,
     top_k: int = 10,
     policy: str = "MlpPolicy",
@@ -561,7 +562,7 @@ def train_phase1_sb3_model(
         use_masking = False
 
     logger.info(
-        "Starting SB3 training | instances=%s | timesteps=%s | use_masking=%s | top_k=%s | check_env=%s | max_train_seconds=%s | episode_time_limit=%s",
+        "Starting SB3 training | instances=%s | timesteps=%s | use_masking=%s | top_k=%s | check_env=%s | max_train_seconds=%s | episode_time_limit=%s | load_model_path=%s",
         len(instance_files),
         total_timesteps,
         use_masking,
@@ -569,6 +570,7 @@ def train_phase1_sb3_model(
         check_environment,
         max_train_seconds,
         episode_time_limit,
+        load_model_path,
     )
 
     base_env = Phase1FeasibilityPumpEnv(
@@ -580,11 +582,17 @@ def train_phase1_sb3_model(
         check_env(base_env, warn=True)
 
     train_env = base_env
+    model_class = PPO
     if use_masking and ActionMasker is not None:
         train_env = ActionMasker(base_env, lambda inner_env: inner_env.action_masks())
-        model = MaskablePPO(policy, train_env, verbose=verbose, seed=seed, **model_kwargs)
+        model_class = MaskablePPO
+
+    if load_model_path:
+        logger.info("Loading existing SB3 model from %s", load_model_path)
+        model = model_class.load(load_model_path, env=train_env)
+        model.set_env(train_env)
     else:
-        model = PPO(policy, train_env, verbose=verbose, seed=seed, **model_kwargs)
+        model = model_class(policy, train_env, verbose=verbose, seed=seed, **model_kwargs)
 
     callback = None
     if max_train_seconds is not None:
@@ -592,7 +600,7 @@ def train_phase1_sb3_model(
             raise ImportError("stable-baselines3 callback support is unavailable in this environment")
         callback = WallClockLimitCallback(max_train_seconds, verbose=verbose)
 
-    model.learn(total_timesteps=total_timesteps, callback=callback)
+    model.learn(total_timesteps=total_timesteps, callback=callback, reset_num_timesteps=not bool(load_model_path))
 
     if model_path:
         model.save(model_path)
