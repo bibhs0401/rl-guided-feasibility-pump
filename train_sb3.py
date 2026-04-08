@@ -103,6 +103,17 @@ def parse_args():
         help="Optional per-episode time cap in seconds inside the FP environment.",
     )
     parser.add_argument(
+        "--min-fp-time-limit",
+        type=float,
+        default=10.0,
+        help="Minimum FP time budget in seconds for each training episode.",
+    )
+    parser.add_argument(
+        "--no-skip-trivial-episodes",
+        action="store_true",
+        help="Do not skip episodes that end before the agent gets to make a decision.",
+    )
+    parser.add_argument(
         "--no-stage-checkpoints",
         action="store_true",
         help="Do not save an extra checkpoint after each folder stage.",
@@ -131,6 +142,8 @@ def main():
             check_environment=not args.skip_env_check,
             max_train_seconds=args.max_train_seconds,
             episode_time_limit=args.episode_time_limit,
+            min_fp_time_limit=args.min_fp_time_limit,
+            skip_trivial_episodes=not args.no_skip_trivial_episodes,
         )
 
         logger.info("Finished training. Saved model to %s", args.model_path)
@@ -169,6 +182,8 @@ def main():
             check_environment=stage_check_environment,
             max_train_seconds=args.max_train_seconds,
             episode_time_limit=args.episode_time_limit,
+            min_fp_time_limit=args.min_fp_time_limit,
+            skip_trivial_episodes=not args.no_skip_trivial_episodes,
         )
 
         if not args.no_stage_checkpoints:

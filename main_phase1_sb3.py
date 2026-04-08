@@ -215,6 +215,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         failure_penalty: float = -5.0,
         log_progress: bool = True,
         episode_time_limit: Optional[float] = None,
+        min_fp_time_limit: Optional[float] = None,
+        skip_trivial_episodes: bool = True,
     ):
         _require_gymnasium()
         _require_pandas()
@@ -231,6 +233,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.failure_penalty = failure_penalty
         self.log_progress = log_progress
         self.episode_time_limit = episode_time_limit
+        self.min_fp_time_limit = min_fp_time_limit
+        self.skip_trivial_episodes = skip_trivial_episodes
 
         obs_size = 6 + (3 * top_k)
         self.observation_space = spaces.Box(
@@ -274,6 +278,8 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.p = p
         self.I, self.not_I = base.get_integer_index(n)
         self.TL, self.T, self.TT, self.R = base.FP_parameters(self.I, m, n)
+        if self.min_fp_time_limit is not None:
+            self.TL = max(self.TL, float(self.min_fp_time_limit))
         if self.episode_time_limit is not None:
             self.TL = min(self.TL, float(self.episode_time_limit))
         self.m1, self.multiplicative_y_m1 = base.first_linear_model(A, b, c, d, n, p, self.I)
@@ -387,8 +393,7 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
         self.solution_value = None
 
         self._load_instance(instance_path)
-        self.fp_start_time = time.time()
-        self.episode_start_time = self.fp_start_time
+        self.episode_start_time = time.time()
         if self.log_progress:
             logger.info(
                 "Episode %s started | instance=%s | m=%s | n=%s | p=%s | TL=%.2fs",
@@ -412,7 +417,11 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
             return
 
         self.x_tilde = base.rounding(self.x_relaxed, self.I)
+        self.fp_start_time = time.time()
         self._solve_until_decision_or_stop()
+
+    def _is_trivial_episode(self) -> bool:
+        return self.decision_counter == 0 and self.nIT == 0 and self.result_reason in {"timeout", "integer", "infeasible"}
 
     def action_masks(self) -> np.ndarray:
         if self.awaiting_action:
@@ -428,6 +437,15 @@ class Phase1FeasibilityPumpEnv(GymEnvBase):
             self._initialize_episode(instance_path)
             if self.awaiting_action or (options and options.get("instance_path")):
                 break
+            if self.skip_trivial_episodes and self._is_trivial_episode():
+                if self.log_progress:
+                    logger.info(
+                        "Skipping trivial episode %s | reason=%s | instance=%s",
+                        self.episode_counter,
+                        self.result_reason,
+                        self.current_instance_path,
+                    )
+                continue
             if self.result_reason not in {"integer", "infeasible"}:
                 break
 
@@ -552,6 +570,8 @@ def train_phase1_sb3_model(
     verbose: int = 1,
     max_train_seconds: Optional[float] = None,
     episode_time_limit: Optional[float] = None,
+    min_fp_time_limit: Optional[float] = None,
+    skip_trivial_episodes: bool = True,
     **model_kwargs,
 ):
     _require_gymnasium()
@@ -562,7 +582,7 @@ def train_phase1_sb3_model(
         use_masking = False
 
     logger.info(
-        "Starting SB3 training | instances=%s | timesteps=%s | use_masking=%s | top_k=%s | check_env=%s | max_train_seconds=%s | episode_time_limit=%s | load_model_path=%s",
+        "Starting SB3 training | instances=%s | timesteps=%s | use_masking=%s | top_k=%s | check_env=%s | max_train_seconds=%s | episode_time_limit=%s | min_fp_time_limit=%s | skip_trivial_episodes=%s | load_model_path=%s",
         len(instance_files),
         total_timesteps,
         use_masking,
@@ -570,6 +590,8 @@ def train_phase1_sb3_model(
         check_environment,
         max_train_seconds,
         episode_time_limit,
+        min_fp_time_limit,
+        skip_trivial_episodes,
         load_model_path,
     )
 
@@ -577,6 +599,8 @@ def train_phase1_sb3_model(
         instance_files,
         top_k=top_k,
         episode_time_limit=episode_time_limit,
+        min_fp_time_limit=min_fp_time_limit,
+        skip_trivial_episodes=skip_trivial_episodes,
     )
     if check_environment and check_env is not None:
         check_env(base_env, warn=True)
