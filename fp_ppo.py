@@ -10,6 +10,7 @@ import gymnasium as gym
 import numpy as np
 from docplex.mp.model import Model
 from gymnasium import spaces
+from scipy import sparse
 
 
 DEFAULT_K_VALUES = [0, 2, 5, 10, 15, 20]
@@ -20,7 +21,7 @@ INTEGER_TOLERANCE = 1e-6
 @dataclass
 class ProblemData:
     instance_path: str
-    A: np.ndarray
+    A: np.ndarray | sparse.csr_matrix
     b: np.ndarray
     c: list[np.ndarray]
     d: list[float]
@@ -68,6 +69,62 @@ def load_problem_from_csv(csv_path: str | Path) -> ProblemData:
         p=p,
         integer_indices=integer_indices,
     )
+
+
+def _read_scalar(value) -> int:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        return _to_int(array.item())
+    return _to_int(array.reshape(-1)[0])
+
+
+def load_problem_from_npz(npz_path: str | Path) -> ProblemData:
+    npz_path = str(npz_path)
+    archive = np.load(npz_path, allow_pickle=False)
+
+    required_keys = {"data", "indices", "indptr", "shape", "b", "c", "d", "n", "m", "p"}
+    missing_keys = sorted(required_keys - set(archive.files))
+    if missing_keys:
+        raise KeyError(f"Missing keys in {npz_path}: {missing_keys}")
+
+    m = _read_scalar(archive["m"])
+    n = _read_scalar(archive["n"])
+    p = _read_scalar(archive["p"])
+
+    A = sparse.csr_matrix(
+        (archive["data"], archive["indices"], archive["indptr"]),
+        shape=tuple(archive["shape"]),
+        dtype=float,
+    )
+    b = np.asarray(archive["b"], dtype=float)
+    c_matrix = np.asarray(archive["c"], dtype=float).reshape(p, n)
+    d = np.asarray(archive["d"], dtype=float).reshape(p).tolist()
+    c = [c_matrix[objective_index].copy() for objective_index in range(p)]
+    integer_indices = list(range(int(INTEGER_VARIABLE_FRACTION * n)))
+
+    return ProblemData(
+        instance_path=npz_path,
+        A=A,
+        b=b,
+        c=c,
+        d=d,
+        m=m,
+        n=n,
+        p=p,
+        integer_indices=integer_indices,
+    )
+
+
+def load_problem(instance_path: str | Path) -> ProblemData:
+    path = Path(instance_path)
+    suffix = path.suffix.lower()
+
+    if suffix == ".npz":
+        return load_problem_from_npz(path)
+    if suffix == ".csv":
+        return load_problem_from_csv(path)
+
+    raise ValueError(f"Unsupported instance format: {path}")
 
 
 def round_integer_values(values: Sequence[float], integer_indices: Sequence[int]) -> list[float]:
@@ -129,6 +186,29 @@ def flip_top_k(
     return updated
 
 
+def iter_matrix_row_entries(matrix: np.ndarray | sparse.csr_matrix, row_index: int):
+    if sparse.isspmatrix_csr(matrix):
+        start = matrix.indptr[row_index]
+        end = matrix.indptr[row_index + 1]
+        indices = matrix.indices[start:end]
+        values = matrix.data[start:end]
+        for col_index, value in zip(indices, values):
+            yield int(col_index), float(value)
+        return
+
+    row = np.asarray(matrix[row_index]).reshape(-1)
+    nonzero_indices = np.nonzero(row)[0]
+    for col_index in nonzero_indices:
+        yield int(col_index), float(row[col_index])
+
+
+def iter_vector_entries(vector: Sequence[float]):
+    array = np.asarray(vector).reshape(-1)
+    nonzero_indices = np.nonzero(array)[0]
+    for index in nonzero_indices:
+        yield int(index), float(array[index])
+
+
 def build_relaxation_model(problem: ProblemData):
     model = Model(name="fp_relaxation")
     model.context.cplex_parameters.threads = 1
@@ -138,7 +218,7 @@ def build_relaxation_model(problem: ProblemData):
 
     for row_index in range(problem.m):
         model.add_constraint(
-            model.sum(problem.A[row_index, col_index] * x[col_index] for col_index in range(problem.n))
+            model.sum(value * x[col_index] for col_index, value in iter_matrix_row_entries(problem.A, row_index))
             <= problem.b[row_index]
         )
 
@@ -146,7 +226,7 @@ def build_relaxation_model(problem: ProblemData):
         model.add_constraint(x[index] <= 1)
 
     for objective_index in range(problem.p):
-        expr = model.sum(problem.c[objective_index][col_index] * x[col_index] for col_index in range(problem.n))
+        expr = model.sum(value * x[col_index] for col_index, value in iter_vector_entries(problem.c[objective_index]))
         model.add_constraint(expr + problem.d[objective_index] == y[objective_index])
 
     model.maximize(model.sum(y))
@@ -163,7 +243,7 @@ def build_distance_model(problem: ProblemData):
 
     for row_index in range(problem.m):
         model.add_constraint(
-            model.sum(problem.A[row_index, col_index] * z[col_index] for col_index in range(problem.n))
+            model.sum(value * z[col_index] for col_index, value in iter_matrix_row_entries(problem.A, row_index))
             <= problem.b[row_index]
         )
 
@@ -171,7 +251,7 @@ def build_distance_model(problem: ProblemData):
         model.add_constraint(z[index] <= 1)
 
     for objective_index in range(problem.p):
-        expr = model.sum(problem.c[objective_index][col_index] * z[col_index] for col_index in range(problem.n))
+        expr = model.sum(value * z[col_index] for col_index, value in iter_vector_entries(problem.c[objective_index]))
         model.add_constraint(expr + problem.d[objective_index] == y[objective_index])
 
     model.minimize(distance_var)
@@ -409,7 +489,7 @@ class FeasibilityPumpKEnv(gym.Env):
                 chosen_index = int(self.np_random.integers(0, len(self.instance_paths)))
                 chosen_path = self.instance_paths[chosen_index]
 
-            self.problem = load_problem_from_csv(chosen_path)
+            self.problem = load_problem(chosen_path)
             self.runner = FeasibilityPumpRunner(
                 problem=self.problem,
                 max_iterations=self.max_iterations,

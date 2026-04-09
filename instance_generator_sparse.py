@@ -12,13 +12,18 @@ import numpy as np
 from scipy import sparse
 
 
-def generate_instance(seed=None, verbose=False, progress_every_rows=1000):
+def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None):
     if seed is not None:
         random.seed(seed)
 
     n = 4000
     m = n * 3
-    p = random.choice(range(5, 6))  # p=5
+    if p is None:
+        p = 3
+    else:
+        p = int(p)
+        if p < 1:
+            raise ValueError("p must be >= 1")
     if verbose:
         print(f"  [generate] Start: n={n}, m={m}, p={p}")
 
@@ -119,6 +124,12 @@ def parse_args():
     parser.add_argument("--num-instances", type=int, default=100, help="Number of instances to generate")
     parser.add_argument("--seed", type=int, default=10, help="Global random seed")
     parser.add_argument(
+        "--p",
+        type=int,
+        default=3,
+        help="Number of y objectives (rows in c matrix)",
+    )
+    parser.add_argument(
         "--progress-every-rows",
         type=int,
         default=1000,
@@ -132,12 +143,16 @@ if __name__ == "__main__":
     out_dir = args.out_dir
     random.seed(args.seed)
     print(
-        f"Starting generation: instances={args.num_instances}, seed={args.seed}, out_dir={out_dir}"
+        f"Starting generation: instances={args.num_instances}, seed={args.seed}, p={args.p}, out_dir={out_dir}"
     )
     for i in range(args.num_instances):
         print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz")
         t0 = time.time()
-        inst = generate_instance(verbose=True, progress_every_rows=args.progress_every_rows)
+        inst = generate_instance(
+            verbose=True,
+            progress_every_rows=args.progress_every_rows,
+            p=args.p,
+        )
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
         print(f"  [save] Writing {path}")
         save_instance(inst, path)

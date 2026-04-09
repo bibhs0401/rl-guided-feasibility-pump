@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument(
         "--instances",
         required=True,
-        help="Glob pattern for CSV instances, for example C:/.../instances/p=3/*/instance*.csv",
+        help="Glob pattern for instance files, for example C:/.../instances/*.npz",
     )
     parser.add_argument(
         "--save-path",
@@ -101,7 +101,7 @@ def main():
 
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
-        raise FileNotFoundError(f"No CSV files matched: {args.instances}")
+        raise FileNotFoundError(f"No instance files matched: {args.instances}")
 
     k_values = parse_k_values(args.k_values)
 
