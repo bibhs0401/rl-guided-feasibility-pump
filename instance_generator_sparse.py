@@ -7,17 +7,20 @@ Used for training the PPO model.
 import os
 import random
 import argparse
+import time
 import numpy as np
 from scipy import sparse
 
 
-def generate_instance(seed=None):
+def generate_instance(seed=None, verbose=False, progress_every_rows=1000):
     if seed is not None:
         random.seed(seed)
 
     n = 4000
     m = n * 3
     p = random.choice(range(5, 6))  # p=5
+    if verbose:
+        print(f"  [generate] Start: n={n}, m={m}, p={p}")
 
     # --- A matrix ---
     weight_bin  = [0.016667] * 31;  weight_bin[0]  = 0.5
@@ -25,6 +28,8 @@ def generate_instance(seed=None):
 
     rows, cols, vals = [], [], []
     for i in range(m):
+        if verbose and (i % progress_every_rows == 0 or i == m - 1):
+            print(f"  [generate] Building A: row {i+1}/{m}")
         for j in range(n):
             v = random.choices(
                 range(31) if j < int(0.8 * n) else range(-30, 31),
@@ -35,11 +40,15 @@ def generate_instance(seed=None):
                 rows.append(i); cols.append(j); vals.append(float(v))
 
     A = sparse.csr_matrix((vals, (rows, cols)), shape=(m, n), dtype=np.float32)
+    if verbose:
+        print("  [generate] A matrix done")
 
     # --- b vector ---
     sparsity = n - np.diff(A.indptr)  # zeros per row
     b = np.array([random.randint(int(sparsity[i]) + 1, int(10 * sparsity[i]) + 1)
                   for i in range(m)], dtype=np.float32)
+    if verbose:
+        print("  [generate] b vector done")
 
     # --- c matrix ---
     rng = range(-10 * p, 10 * p + 1)
@@ -66,6 +75,8 @@ def generate_instance(seed=None):
                     c[idx + n] *= -1
 
     c = np.array(c, dtype=np.float32).reshape(p, n)
+    if verbose:
+        print("  [generate] c matrix done")
 
     # --- d vector ---
     d = np.array([
@@ -73,6 +84,8 @@ def generate_instance(seed=None):
                        int(sum(abs(v) for v in c[k] if v < 0)) + 10)
         for k in range(p)
     ], dtype=np.float32)
+    if verbose:
+        print("  [generate] d vector done")
 
     return {"A": A, "b": b, "c": c, "d": d, "n": n, "m": m, "p": p}
 
@@ -105,6 +118,12 @@ def parse_args():
     parser.add_argument("--out-dir", default="./instances", help="Output directory for .npz files")
     parser.add_argument("--num-instances", type=int, default=100, help="Number of instances to generate")
     parser.add_argument("--seed", type=int, default=10, help="Global random seed")
+    parser.add_argument(
+        "--progress-every-rows",
+        type=int,
+        default=1000,
+        help="Print A-matrix row progress every N rows during generation",
+    )
     return parser.parse_args()
 
 
@@ -112,9 +131,18 @@ if __name__ == "__main__":
     args = parse_args()
     out_dir = args.out_dir
     random.seed(args.seed)
+    print(
+        f"Starting generation: instances={args.num_instances}, seed={args.seed}, out_dir={out_dir}"
+    )
     for i in range(args.num_instances):
-        inst = generate_instance()
+        print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz")
+        t0 = time.time()
+        inst = generate_instance(verbose=True, progress_every_rows=args.progress_every_rows)
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
+        print(f"  [save] Writing {path}")
         save_instance(inst, path)
+        elapsed = time.time() - t0
         mb = os.path.getsize(path) / 1024**2
-        print(f"instance_{i+1}: n={inst['n']}, m={inst['m']}, p={inst['p']}, {mb:.1f} MB")
+        print(
+            f"[{i+1}/{args.num_instances}] Done: n={inst['n']}, m={inst['m']}, p={inst['p']}, {mb:.1f} MB, {elapsed:.1f}s"
+        )
