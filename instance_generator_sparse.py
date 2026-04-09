@@ -1,10 +1,12 @@
 """
 instance_generator_sparse.py
-Matches new_instance_generator_MIP.ipynb exactly, saves as sparse .npz.
+saves the instances as sparse .npz, significantly compact than the dense version(csv).
+Used for training the PPO model.
 """
 
 import os
 import random
+import argparse
 import numpy as np
 from scipy import sparse
 
@@ -44,7 +46,7 @@ def generate_instance(seed=None):
     wc  = [0.5 / len(rng)] * len(rng);  wc[10 * p] = 0.5
     c   = [random.choices(rng, weights=wc, k=1)[0] for _ in range(n * p)]
 
-    # sign-balancing (from notebook)
+    # sign-balancing to ensure the instance is feasible
     pos, neg = [0] * n, [0] * n
     for idx in range(len(c)):
         col = idx % n
@@ -98,11 +100,19 @@ def load_instance(path, dense=False):
             "n": int(arc["n"][0]), "m": int(arc["m"][0]), "p": int(arc["p"][0])}
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate sparse MIP instances.")
+    parser.add_argument("--out-dir", default="./instances", help="Output directory for .npz files")
+    parser.add_argument("--num-instances", type=int, default=100, help="Number of instances to generate")
+    parser.add_argument("--seed", type=int, default=10, help="Global random seed")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    out_dir = "./instances"
-    random.seed(10)
-    num_instances = 100
-    for i in range(num_instances):
+    args = parse_args()
+    out_dir = args.out_dir
+    random.seed(args.seed)
+    for i in range(args.num_instances):
         inst = generate_instance()
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
         save_instance(inst, path)
