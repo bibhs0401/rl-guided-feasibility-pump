@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import glob
 import logging
 import sys
@@ -136,6 +137,12 @@ def parse_args():
         default=100,
         help="How often to log training progress in environment steps.",
     )
+    parser.add_argument(
+        "--dashboard-window",
+        type=int,
+        default=100,
+        help="Rolling episode window used by dashboard metrics.",
+    )
     return parser.parse_args()
 
 
@@ -169,26 +176,26 @@ def resolve_device(device_name: str) -> str:
 
 
 class TrainingLoggerCallback(BaseCallback):
-    def __init__(self, total_timesteps: int, log_every_steps: int):
+    def __init__(self, total_timesteps: int, log_every_steps: int, rolling_window: int):
         super().__init__()
         self.total_timesteps = total_timesteps
         self.log_every_steps = max(1, log_every_steps)
         self.next_progress_log = self.log_every_steps
+        self.rolling_window = max(1, rolling_window)
+        self.success_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.return_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.final_distance_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.failure_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.steps_to_success_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.stall_recovery_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.flips_per_step_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.no_flip_ratio_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.solve_seconds_history: deque[float] = deque(maxlen=self.rolling_window)
 
     def _on_training_start(self) -> None:
         logger.info("SB3 training loop started")
 
     def _on_step(self) -> bool:
-        if self.num_timesteps >= self.next_progress_log:
-            progress = 100.0 * self.num_timesteps / max(1, self.total_timesteps)
-            logger.info(
-                "Training progress: %d / %d timesteps (%.1f%%)",
-                self.num_timesteps,
-                self.total_timesteps,
-                progress,
-            )
-            self.next_progress_log += self.log_every_steps
-
         infos = self.locals.get("infos", [])
         dones = self.locals.get("dones", [])
 
@@ -196,11 +203,43 @@ class TrainingLoggerCallback(BaseCallback):
             if not done or not info:
                 continue
 
+            monitor_episode = info.get("episode")
+            if isinstance(monitor_episode, dict) and "r" in monitor_episode:
+                self.return_history.append(float(monitor_episode["r"]))
+
+            integer_found = bool(info.get("integer_found", False))
+            failed = bool(info.get("failed", False))
+            final_distance = float(info.get("distance", 0.0))
+            iterations = float(info.get("iterations", 0.0))
+            no_flip_steps = float(info.get("no_flip_steps", 0.0))
+            perturb_steps = float(info.get("perturb_steps", 0.0))
+            total_flips = float(info.get("total_flips", 0.0))
+            stall_recoveries = float(info.get("stall_recoveries", 0.0))
+            stall_events = float(info.get("stall_events", 0.0))
+            last_solve_seconds = float(info.get("last_distance_solve_seconds", 0.0))
+
+            self.success_history.append(1.0 if integer_found else 0.0)
+            self.final_distance_history.append(final_distance)
+            self.failure_history.append(1.0 if failed else 0.0)
+            self.solve_seconds_history.append(last_solve_seconds)
+
+            if integer_found:
+                self.steps_to_success_history.append(iterations)
+            if stall_events > 0:
+                self.stall_recovery_history.append(stall_recoveries / stall_events)
+            if iterations > 0:
+                self.flips_per_step_history.append(total_flips / iterations)
+                self.no_flip_ratio_history.append(no_flip_steps / iterations)
+            elif perturb_steps > 0:
+                self.flips_per_step_history.append(total_flips / perturb_steps)
+                self.no_flip_ratio_history.append(0.0)
+
             instance_name = Path(str(info.get("instance_path", "unknown"))).name
+            env_episode = info.get("env_episode", "?")
             logger.info(
                 "Episode %s finished: instance=%s iterations=%s decisions=%s integer_found=%s "
                 "failed=%s distance=%.4f load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
-                info.get("episode", "?"),
+                env_episode,
                 instance_name,
                 info.get("iterations", "?"),
                 info.get("decisions", "?"),
@@ -212,6 +251,41 @@ class TrainingLoggerCallback(BaseCallback):
                 float(info.get("last_distance_solve_seconds", 0.0)),
                 float(info.get("elapsed_seconds", 0.0)),
             )
+
+        if self.num_timesteps >= self.next_progress_log:
+            progress = 100.0 * self.num_timesteps / max(1, self.total_timesteps)
+            self.next_progress_log += self.log_every_steps
+
+            def mean_or_nan(values: deque[float]) -> float:
+                if not values:
+                    return float("nan")
+                return sum(values) / len(values)
+
+            if self.success_history:
+                logger.info(
+                    "Dashboard t=%d/%d (%.1f%%) | window=%d | sr=%.3f | ret=%.3f | dist=%.3f | "
+                    "fail=%.3f | flips/step=%.3f | noflip=%.3f | stall_recover=%.3f | succ_steps=%.2f | solve_s=%.3f",
+                    self.num_timesteps,
+                    self.total_timesteps,
+                    progress,
+                    len(self.success_history),
+                    mean_or_nan(self.success_history),
+                    mean_or_nan(self.return_history),
+                    mean_or_nan(self.final_distance_history),
+                    mean_or_nan(self.failure_history),
+                    mean_or_nan(self.flips_per_step_history),
+                    mean_or_nan(self.no_flip_ratio_history),
+                    mean_or_nan(self.stall_recovery_history),
+                    mean_or_nan(self.steps_to_success_history),
+                    mean_or_nan(self.solve_seconds_history),
+                )
+            else:
+                logger.info(
+                    "Dashboard t=%d/%d (%.1f%%) | waiting for completed episodes",
+                    self.num_timesteps,
+                    self.total_timesteps,
+                    progress,
+                )
 
         return True
 
@@ -271,6 +345,7 @@ def main():
     callback = TrainingLoggerCallback(
         total_timesteps=args.total_timesteps,
         log_every_steps=args.progress_log_steps,
+        rolling_window=args.dashboard_window,
     )
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
     model.save(str(save_path))

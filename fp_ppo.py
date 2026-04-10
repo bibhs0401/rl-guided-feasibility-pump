@@ -199,8 +199,14 @@ def build_distance_model(problem: ProblemData):
     return model, z, y, distance_var
 
 
-def solve_relaxation_model(model: Model, x_vars, y_vars):
-    solution = model.solve(log_output=False)
+def solve_with_time_limit(model: Model, max_seconds: float | None):
+    if max_seconds is not None:
+        model.set_time_limit(max(0.01, float(max_seconds)))
+    return model.solve(log_output=False)
+
+
+def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: float | None = None):
+    solution = solve_with_time_limit(model, max_seconds)
     if solution is None:
         return None
 
@@ -216,6 +222,7 @@ def solve_distance_model(
     distance_var,
     rounded_values: Sequence[float],
     integer_indices: Sequence[int],
+    max_seconds: float | None = None,
 ):
     distance_constraint = model.add_constraint(
         distance_var
@@ -224,7 +231,7 @@ def solve_distance_model(
     )
 
     try:
-        solution = model.solve(log_output=False)
+        solution = solve_with_time_limit(model, max_seconds)
         if solution is None:
             return None
 
@@ -255,6 +262,7 @@ class FeasibilityPumpRunner:
         self.distance_z = None
         self.distance_y = None
         self.distance_var = None
+        self.episode_index = 0
 
         self.start_time = None
         self.iteration = 0
@@ -265,6 +273,12 @@ class FeasibilityPumpRunner:
         self.consecutive_no_change = 0
         self.last_rounding_changed = True
         self.last_flip_indices: list[int] = []
+        self.total_flips = 0
+        self.no_flip_steps = 0
+        self.perturb_steps = 0
+        self.stall_events = 0
+        self.stall_recoveries = 0
+        self._was_stalled_last_step = False
         self.relaxation_build_seconds = 0.0
         self.distance_build_seconds = 0.0
         self.relaxation_solve_seconds = 0.0
@@ -275,12 +289,19 @@ class FeasibilityPumpRunner:
         self.x_tilde = None
         self.y_values = None
 
+    def remaining_time(self) -> float | None:
+        if self.start_time is None:
+            return None
+        return self.time_limit - (time.time() - self.start_time)
+
     def reset(self) -> None:
         reset_started = time.time()
         instance_name = Path(self.problem.instance_path).name
+        self.start_time = reset_started
 
         logger.info(
-            "Building FP models for %s (n=%d, m=%d, p=%d)",
+            "Episode %d building FP models for %s (n=%d, m=%d, p=%d)",
+            self.episode_index,
             instance_name,
             self.problem.n,
             self.problem.m,
@@ -296,14 +317,14 @@ class FeasibilityPumpRunner:
         self.distance_build_seconds = time.time() - build_started
 
         logger.info(
-            "Built FP models for %s in %.2fs (relaxation=%.2fs, distance=%.2fs)",
+            "Episode %d built FP models for %s in %.2fs (relaxation=%.2fs, distance=%.2fs)",
+            self.episode_index,
             instance_name,
             self.relaxation_build_seconds + self.distance_build_seconds,
             self.relaxation_build_seconds,
             self.distance_build_seconds,
         )
 
-        self.start_time = time.time()
         self.iteration = 0
         self.decision_count = 0
         self.done = False
@@ -312,24 +333,46 @@ class FeasibilityPumpRunner:
         self.consecutive_no_change = 0
         self.last_rounding_changed = True
         self.last_flip_indices = []
+        self.total_flips = 0
+        self.no_flip_steps = 0
+        self.perturb_steps = 0
+        self.stall_events = 0
+        self.stall_recoveries = 0
+        self._was_stalled_last_step = False
         self.relaxation_solve_seconds = 0.0
         self.last_distance_solve_seconds = 0.0
         self.x_list = None
         self.x_tilde = None
         self.y_values = None
 
-        logger.info("Solving initial LP relaxation for %s", instance_name)
+        logger.info("Episode %d solving initial LP relaxation for %s", self.episode_index, instance_name)
 
         try:
+            remaining_time = self.remaining_time()
+            if remaining_time is not None and remaining_time <= 0:
+                self.done = True
+                logger.warning(
+                    "Episode %d ran out of time before the initial LP relaxation for %s",
+                    self.episode_index,
+                    instance_name,
+                )
+                return
+
             solve_started = time.time()
-            relaxation_result = solve_relaxation_model(self.relaxation_model, self.relaxation_x, self.relaxation_y)
+            relaxation_result = solve_relaxation_model(
+                self.relaxation_model,
+                self.relaxation_x,
+                self.relaxation_y,
+                max_seconds=remaining_time,
+            )
             self.relaxation_solve_seconds = time.time() - solve_started
 
             if relaxation_result is None:
                 self.failed = True
                 self.done = True
                 logger.warning(
-                    "Initial LP relaxation failed for %s after %.2fs",
+                    "Episode %d initial LP relaxation failed for %s after %.2fs",
+                    self.episode_index,
                     instance_name,
                     self.relaxation_solve_seconds,
                 )
@@ -342,7 +385,8 @@ class FeasibilityPumpRunner:
                 self.integer_found = True
                 self.done = True
                 logger.info(
-                    "Initial LP relaxation already found an integer solution for %s in %.2fs",
+                    "Episode %d initial LP relaxation already found an integer solution for %s in %.2fs",
+                    self.episode_index,
                     instance_name,
                     self.relaxation_solve_seconds,
                 )
@@ -351,7 +395,8 @@ class FeasibilityPumpRunner:
             self.x_tilde = round_integer_values(self.x_list, self.problem.integer_indices)
             self.consecutive_no_change = 0
             logger.info(
-                "Reset complete for %s in %.2fs (initial_solve=%.2fs, distance=%.4f)",
+                "Episode %d reset complete for %s in %.2fs (initial_solve=%.2fs, distance=%.4f)",
+                self.episode_index,
                 instance_name,
                 self.relaxation_build_seconds + self.distance_build_seconds + self.relaxation_solve_seconds,
                 self.relaxation_solve_seconds,
@@ -372,6 +417,11 @@ class FeasibilityPumpRunner:
         num_flips = len(selected_indices)
         self.decision_count += 1
         self.last_flip_indices = list(selected_indices)
+        self.total_flips += num_flips
+        if num_flips > 0:
+            self.perturb_steps += 1
+        else:
+            self.no_flip_steps += 1
 
         if selected_indices:
             self.x_tilde = flip_selected_variables(self.x_tilde, selected_indices)
@@ -380,7 +430,8 @@ class FeasibilityPumpRunner:
             self.done = True
             return
 
-        if self.start_time is not None and (time.time() - self.start_time) >= self.time_limit:
+        remaining_time = self.remaining_time()
+        if remaining_time is not None and remaining_time <= 0:
             self.done = True
             return
 
@@ -388,7 +439,8 @@ class FeasibilityPumpRunner:
 
         if should_log_iteration:
             logger.debug(
-                "Iteration %d starting for %s: flips=%d distance=%.4f stalled=%s",
+                "Episode %d iteration %d starting for %s: flips=%d distance=%.4f stalled=%s",
+                self.episode_index,
                 self.iteration + 1,
                 instance_name,
                 num_flips,
@@ -404,6 +456,7 @@ class FeasibilityPumpRunner:
             self.distance_var,
             self.x_tilde,
             self.problem.integer_indices,
+            max_seconds=remaining_time,
         )
         self.last_distance_solve_seconds = time.time() - solve_started
         self.iteration += 1
@@ -412,7 +465,8 @@ class FeasibilityPumpRunner:
             self.failed = True
             self.done = True
             logger.warning(
-                "Distance solve failed for %s at iteration %d after %.2fs",
+                "Episode %d distance solve failed for %s at iteration %d after %.2fs",
+                self.episode_index,
                 instance_name,
                 self.iteration,
                 self.last_distance_solve_seconds,
@@ -425,7 +479,8 @@ class FeasibilityPumpRunner:
             self.integer_found = True
             self.done = True
             logger.info(
-                "Integer solution found for %s at iteration %d after %.2fs",
+                "Episode %d integer solution found for %s at iteration %d after %.2fs",
+                self.episode_index,
                 instance_name,
                 self.iteration,
                 self.last_distance_solve_seconds,
@@ -444,6 +499,13 @@ class FeasibilityPumpRunner:
         else:
             self.consecutive_no_change += 1
 
+        currently_stalled = self.is_stalled()
+        if currently_stalled and not self._was_stalled_last_step:
+            self.stall_events += 1
+        if self._was_stalled_last_step and not currently_stalled:
+            self.stall_recoveries += 1
+        self._was_stalled_last_step = currently_stalled
+
         heartbeat_iteration = self.iteration <= 3 or self.iteration % DEFAULT_LOG_INTERVAL == 0
         should_log_iteration = (
             should_log_iteration
@@ -455,9 +517,10 @@ class FeasibilityPumpRunner:
 
         if should_log_iteration:
             message = (
-                "Iteration %d complete for %s: flips=%d solve=%.2fs distance=%.4f changed=%s stalled=%s done=%s"
+                "Episode %d iteration %d complete for %s: flips=%d solve=%.2fs distance=%.4f changed=%s stalled=%s done=%s"
             )
             args = (
+                self.episode_index,
                 self.iteration,
                 instance_name,
                 num_flips,
@@ -468,7 +531,13 @@ class FeasibilityPumpRunner:
                 self.done,
             )
 
-            if num_flips > 0 or self.last_distance_solve_seconds >= 5.0 or self.is_stalled() or self.done:
+            if (
+                num_flips > 0
+                or heartbeat_iteration
+                or self.last_distance_solve_seconds >= 5.0
+                or self.is_stalled()
+                or self.done
+            ):
                 logger.info(message, *args)
             else:
                 logger.debug(message, *args)
@@ -639,6 +708,7 @@ class FeasibilityPumpFlipEnv(gym.Env):
                 time_limit=self.time_limit,
                 stall_threshold=self.stall_threshold,
             )
+            self.runner.episode_index = self.episode_index
             self.runner.reset()
             self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
 
@@ -707,10 +777,15 @@ class FeasibilityPumpFlipEnv(gym.Env):
             return {}
 
         return {
-            "episode": self.episode_index,
+            "env_episode": self.episode_index,
             "instance_path": self.problem.instance_path,
             "iterations": self.runner.iteration,
             "decisions": self.runner.decision_count,
+            "no_flip_steps": self.runner.no_flip_steps,
+            "perturb_steps": self.runner.perturb_steps,
+            "total_flips": self.runner.total_flips,
+            "stall_events": self.runner.stall_events,
+            "stall_recoveries": self.runner.stall_recoveries,
             "stalled": self.runner.is_stalled(),
             "integer_found": self.runner.integer_found,
             "failed": self.runner.failed,
