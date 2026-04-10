@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import glob
+import logging
+import sys
 from pathlib import Path
 
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
+import torch
 
 from fp_ppo import (
     DEFAULT_NUM_CANDIDATES,
@@ -14,6 +18,9 @@ from fp_ppo import (
     DEFAULT_TIME_LIMIT,
     FeasibilityPumpFlipEnv,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -106,11 +113,116 @@ def parse_args():
         default=None,
         help="Optional TensorBoard log directory.",
     )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=["cuda", "cpu", "auto"],
+        help="Torch device for PPO. Defaults to cuda.",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Python logging level.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Optional log file path. Helpful on Linux servers for long runs.",
+    )
+    parser.add_argument(
+        "--progress-log-steps",
+        type=int,
+        default=100,
+        help="How often to log training progress in environment steps.",
+    )
     return parser.parse_args()
+
+
+def setup_logging(level_name: str, log_file: str | None) -> None:
+    handlers = [logging.StreamHandler(sys.stdout)]
+
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+
+    logging.basicConfig(
+        level=getattr(logging, level_name),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+
+def resolve_device(device_name: str) -> str:
+    if device_name == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested, but torch.cuda.is_available() is False. "
+            "Install a CUDA-enabled PyTorch build and make sure your GPU driver is working."
+        )
+
+    return device_name
+
+
+class TrainingLoggerCallback(BaseCallback):
+    def __init__(self, total_timesteps: int, log_every_steps: int):
+        super().__init__()
+        self.total_timesteps = total_timesteps
+        self.log_every_steps = max(1, log_every_steps)
+        self.next_progress_log = self.log_every_steps
+
+    def _on_training_start(self) -> None:
+        logger.info("SB3 training loop started")
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps >= self.next_progress_log:
+            progress = 100.0 * self.num_timesteps / max(1, self.total_timesteps)
+            logger.info(
+                "Training progress: %d / %d timesteps (%.1f%%)",
+                self.num_timesteps,
+                self.total_timesteps,
+                progress,
+            )
+            self.next_progress_log += self.log_every_steps
+
+        infos = self.locals.get("infos", [])
+        dones = self.locals.get("dones", [])
+
+        for done, info in zip(dones, infos):
+            if not done or not info:
+                continue
+
+            instance_name = Path(str(info.get("instance_path", "unknown"))).name
+            logger.info(
+                "Episode %s finished: instance=%s iterations=%s decisions=%s integer_found=%s "
+                "failed=%s distance=%.4f load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
+                info.get("episode", "?"),
+                instance_name,
+                info.get("iterations", "?"),
+                info.get("decisions", "?"),
+                info.get("integer_found", False),
+                info.get("failed", False),
+                float(info.get("distance", 0.0)),
+                float(info.get("load_seconds", 0.0)),
+                float(info.get("reset_seconds", 0.0)),
+                float(info.get("last_distance_solve_seconds", 0.0)),
+                float(info.get("elapsed_seconds", 0.0)),
+            )
+
+        return True
+
+    def _on_training_end(self) -> None:
+        logger.info("SB3 training loop finished")
 
 
 def main():
     args = parse_args()
+    setup_logging(args.log_level, args.log_file)
+    device = resolve_device(args.device)
 
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
@@ -132,11 +244,14 @@ def main():
     save_path = Path(args.save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Training on {len(instance_paths)} instances")
-    print(f"candidate variables per decision: {args.num_candidates}")
-    print(f"time limit per episode: {args.time_limit} seconds")
-    print(f"stall threshold: {args.stall_threshold}")
-    print(f"Saving model to: {save_path}")
+    logger.info("Training on %d instances", len(instance_paths))
+    logger.info("Candidate variables per decision: %d", args.num_candidates)
+    logger.info("Time limit per episode: %.1f seconds", args.time_limit)
+    logger.info("Stall threshold: %d", args.stall_threshold)
+    logger.info("Using torch device: %s", device)
+    logger.info("Saving model to: %s", save_path)
+    if args.log_file:
+        logger.info("Writing logs to: %s", args.log_file)
 
     model = PPO(
         policy="MlpPolicy",
@@ -150,12 +265,17 @@ def main():
         seed=args.seed,
         tensorboard_log=args.tensorboard_log,
         policy_kwargs={"net_arch": [64, 64]},
+        device=device,
     )
 
-    model.learn(total_timesteps=args.total_timesteps)
+    callback = TrainingLoggerCallback(
+        total_timesteps=args.total_timesteps,
+        log_every_steps=args.progress_log_steps,
+    )
+    model.learn(total_timesteps=args.total_timesteps, callback=callback)
     model.save(str(save_path))
 
-    print("Training complete.")
+    logger.info("Training complete")
 
 
 if __name__ == "__main__":
