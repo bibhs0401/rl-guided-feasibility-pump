@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +12,9 @@ from gymnasium import spaces
 from scipy import sparse
 
 
-DEFAULT_K_VALUES = [0, 2, 5, 10, 15, 20]
+DEFAULT_NUM_CANDIDATES = 20
+DEFAULT_TIME_LIMIT = 30.0
+DEFAULT_STALL_THRESHOLD = 3
 INTEGER_VARIABLE_FRACTION = 0.8
 INTEGER_TOLERANCE = 1e-6
 
@@ -21,7 +22,7 @@ INTEGER_TOLERANCE = 1e-6
 @dataclass
 class ProblemData:
     instance_path: str
-    A: np.ndarray | sparse.csr_matrix
+    A: sparse.csr_matrix
     b: np.ndarray
     c: list[np.ndarray]
     d: list[float]
@@ -35,42 +36,6 @@ def _to_int(value: str) -> int:
     return int(float(value))
 
 
-def load_problem_from_csv(csv_path: str | Path) -> ProblemData:
-    csv_path = str(csv_path)
-    with open(csv_path, newline="") as csv_file:
-        rows = list(csv.DictReader(csv_file))
-
-    if not rows:
-        raise ValueError(f"Instance file is empty: {csv_path}")
-
-    m = _to_int(rows[0]["m"])
-    n = _to_int(rows[0]["n"])
-    p = _to_int(rows[0]["p"])
-
-    d = [float(rows[i]["d"]) for i in range(p)]
-    c = []
-    for objective_index in range(p):
-        start = objective_index * n
-        end = (objective_index + 1) * n
-        c.append(np.array([float(rows[i]["c"]) for i in range(start, end)], dtype=float))
-
-    b = np.array([float(rows[i]["b"]) for i in range(m)], dtype=float)
-    A = np.array([float(row["A"]) for row in rows], dtype=float).reshape(m, n)
-    integer_indices = list(range(int(INTEGER_VARIABLE_FRACTION * n)))
-
-    return ProblemData(
-        instance_path=csv_path,
-        A=A,
-        b=b,
-        c=c,
-        d=d,
-        m=m,
-        n=n,
-        p=p,
-        integer_indices=integer_indices,
-    )
-
-
 def _read_scalar(value) -> int:
     array = np.asarray(value)
     if array.ndim == 0:
@@ -78,14 +43,17 @@ def _read_scalar(value) -> int:
     return _to_int(array.reshape(-1)[0])
 
 
-def load_problem_from_npz(npz_path: str | Path) -> ProblemData:
-    npz_path = str(npz_path)
-    archive = np.load(npz_path, allow_pickle=False)
+def load_problem(instance_path: str | Path) -> ProblemData:
+    path = Path(instance_path)
+    if path.suffix.lower() != ".npz":
+        raise ValueError(f"Expected a sparse .npz instance file, got: {path}")
+
+    archive = np.load(path, allow_pickle=False)
 
     required_keys = {"data", "indices", "indptr", "shape", "b", "c", "d", "n", "m", "p"}
     missing_keys = sorted(required_keys - set(archive.files))
     if missing_keys:
-        raise KeyError(f"Missing keys in {npz_path}: {missing_keys}")
+        raise KeyError(f"Missing keys in {path}: {missing_keys}")
 
     m = _read_scalar(archive["m"])
     n = _read_scalar(archive["n"])
@@ -103,7 +71,7 @@ def load_problem_from_npz(npz_path: str | Path) -> ProblemData:
     integer_indices = list(range(int(INTEGER_VARIABLE_FRACTION * n)))
 
     return ProblemData(
-        instance_path=npz_path,
+        instance_path=str(path),
         A=A,
         b=b,
         c=c,
@@ -113,18 +81,6 @@ def load_problem_from_npz(npz_path: str | Path) -> ProblemData:
         p=p,
         integer_indices=integer_indices,
     )
-
-
-def load_problem(instance_path: str | Path) -> ProblemData:
-    path = Path(instance_path)
-    suffix = path.suffix.lower()
-
-    if suffix == ".npz":
-        return load_problem_from_npz(path)
-    if suffix == ".csv":
-        return load_problem_from_csv(path)
-
-    raise ValueError(f"Unsupported instance format: {path}")
 
 
 def round_integer_values(values: Sequence[float], integer_indices: Sequence[int]) -> list[float]:
@@ -164,42 +120,23 @@ def fp_distance(
     return float(sum(abs(values[index] - rounded_values[index]) for index in integer_indices))
 
 
-def flip_top_k(
+def flip_selected_variables(
     rounded_values: Sequence[float],
-    relaxed_values: Sequence[float],
-    integer_indices: Sequence[int],
-    k: int,
+    selected_indices: Sequence[int],
 ) -> list[float]:
     updated = list(rounded_values)
-    if k <= 0 or not integer_indices:
-        return updated
-
-    scored_indices = sorted(
-        integer_indices,
-        key=lambda index: abs(relaxed_values[index] - rounded_values[index]),
-        reverse=True,
-    )
-
-    for index in scored_indices[: min(k, len(scored_indices))]:
+    for index in selected_indices:
         updated[index] = 1 - updated[index]
-
     return updated
 
 
-def iter_matrix_row_entries(matrix: np.ndarray | sparse.csr_matrix, row_index: int):
-    if sparse.isspmatrix_csr(matrix):
-        start = matrix.indptr[row_index]
-        end = matrix.indptr[row_index + 1]
-        indices = matrix.indices[start:end]
-        values = matrix.data[start:end]
-        for col_index, value in zip(indices, values):
-            yield int(col_index), float(value)
-        return
-
-    row = np.asarray(matrix[row_index]).reshape(-1)
-    nonzero_indices = np.nonzero(row)[0]
-    for col_index in nonzero_indices:
-        yield int(col_index), float(row[col_index])
+def iter_matrix_row_entries(matrix: sparse.csr_matrix, row_index: int):
+    start = matrix.indptr[row_index]
+    end = matrix.indptr[row_index + 1]
+    indices = matrix.indices[start:end]
+    values = matrix.data[start:end]
+    for col_index, value in zip(indices, values):
+        yield int(col_index), float(value)
 
 
 def iter_vector_entries(vector: Sequence[float]):
@@ -299,11 +236,13 @@ class FeasibilityPumpRunner:
         self,
         problem: ProblemData,
         max_iterations: int = 100,
-        time_limit: float | None = None,
+        time_limit: float = DEFAULT_TIME_LIMIT,
+        stall_threshold: int = DEFAULT_STALL_THRESHOLD,
     ):
         self.problem = problem
         self.max_iterations = max_iterations
-        self.time_limit = time_limit if time_limit is not None else float(np.log(problem.m + problem.n) / 4.0)
+        self.time_limit = float(time_limit)
+        self.stall_threshold = stall_threshold
 
         self.relaxation_model = None
         self.relaxation_x = None
@@ -319,8 +258,9 @@ class FeasibilityPumpRunner:
         self.done = False
         self.failed = False
         self.integer_found = False
-        self.stalled = False
-        self.last_k = 0
+        self.consecutive_no_change = 0
+        self.last_rounding_changed = True
+        self.last_flip_indices: list[int] = []
 
         self.x_list = None
         self.x_tilde = None
@@ -336,8 +276,9 @@ class FeasibilityPumpRunner:
         self.done = False
         self.failed = False
         self.integer_found = False
-        self.stalled = False
-        self.last_k = 0
+        self.consecutive_no_change = 0
+        self.last_rounding_changed = True
+        self.last_flip_indices = []
         self.x_list = None
         self.x_tilde = None
         self.y_values = None
@@ -357,57 +298,62 @@ class FeasibilityPumpRunner:
             return
 
         self.x_tilde = round_integer_values(self.x_list, self.problem.integer_indices)
-        self.advance_until_stall_or_done()
+        self.consecutive_no_change = 0
 
-    def advance_until_stall_or_done(self) -> None:
-        self.stalled = False
+    def is_stalled(self) -> bool:
+        return self.consecutive_no_change >= self.stall_threshold
 
-        while not self.done:
-            if self.iteration >= self.max_iterations:
-                self.done = True
-                return
-
-            if self.start_time is not None and (time.time() - self.start_time) >= self.time_limit:
-                self.done = True
-                return
-
-            distance_result = solve_distance_model(
-                self.distance_model,
-                self.distance_z,
-                self.distance_y,
-                self.distance_var,
-                self.x_tilde,
-                self.problem.integer_indices,
-            )
-            self.iteration += 1
-
-            if distance_result is None:
-                self.failed = True
-                self.done = True
-                return
-
-            self.x_list, self.y_values, _ = distance_result
-
-            if is_integer_solution(self.x_list, self.problem.integer_indices):
-                self.integer_found = True
-                self.done = True
-                return
-
-            if rounding_changed(self.x_list, self.x_tilde, self.problem.integer_indices):
-                self.x_tilde = round_integer_values(self.x_list, self.problem.integer_indices)
-                continue
-
-            self.stalled = True
-            return
-
-    def apply_perturbation(self, k: int) -> None:
+    def run_one_iteration(self, selected_indices: Sequence[int]) -> None:
         if self.done or self.x_tilde is None or self.x_list is None:
             return
 
         self.decision_count += 1
-        self.last_k = k
-        self.stalled = False
-        self.x_tilde = flip_top_k(self.x_tilde, self.x_list, self.problem.integer_indices, k)
+        self.last_flip_indices = list(selected_indices)
+
+        if selected_indices:
+            self.x_tilde = flip_selected_variables(self.x_tilde, selected_indices)
+
+        if self.iteration >= self.max_iterations:
+            self.done = True
+            return
+
+        if self.start_time is not None and (time.time() - self.start_time) >= self.time_limit:
+            self.done = True
+            return
+
+        distance_result = solve_distance_model(
+            self.distance_model,
+            self.distance_z,
+            self.distance_y,
+            self.distance_var,
+            self.x_tilde,
+            self.problem.integer_indices,
+        )
+        self.iteration += 1
+
+        if distance_result is None:
+            self.failed = True
+            self.done = True
+            return
+
+        self.x_list, self.y_values, _ = distance_result
+
+        if is_integer_solution(self.x_list, self.problem.integer_indices):
+            self.integer_found = True
+            self.done = True
+            return
+
+        self.last_rounding_changed = rounding_changed(
+            self.x_list,
+            self.x_tilde,
+            self.problem.integer_indices,
+        )
+
+        if self.last_rounding_changed:
+            self.x_tilde = round_integer_values(self.x_list, self.problem.integer_indices)
+            self.consecutive_no_change = 0
+        else:
+            self.consecutive_no_change += 1
 
     def current_distance(self) -> float:
         if self.integer_found:
@@ -417,13 +363,32 @@ class FeasibilityPumpRunner:
         return fp_distance(self.x_list, self.x_tilde, self.problem.integer_indices)
 
 
-def build_observation(runner: FeasibilityPumpRunner) -> np.ndarray:
+def select_flip_candidates(
+    runner: FeasibilityPumpRunner,
+    num_candidates: int,
+) -> list[int]:
     if runner.x_list is None or runner.x_tilde is None:
-        return np.zeros(6, dtype=np.float32)
+        return []
+
+    scored_indices = sorted(
+        runner.problem.integer_indices,
+        key=lambda index: abs(runner.x_list[index] - runner.x_tilde[index]),
+        reverse=True,
+    )
+    return scored_indices[: min(num_candidates, len(scored_indices))]
+
+
+def build_observation(
+    runner: FeasibilityPumpRunner,
+    candidate_indices: Sequence[int],
+    num_candidates: int,
+) -> np.ndarray:
+    if runner.x_list is None or runner.x_tilde is None:
+        return np.zeros(8 + 3 * num_candidates, dtype=np.float32)
 
     integer_indices = runner.problem.integer_indices
     if not integer_indices:
-        return np.zeros(6, dtype=np.float32)
+        return np.zeros(8 + 3 * num_candidates, dtype=np.float32)
 
     fractionality = np.array(
         [abs(runner.x_list[index] - round(runner.x_list[index])) for index in integer_indices],
@@ -436,6 +401,8 @@ def build_observation(runner: FeasibilityPumpRunner) -> np.ndarray:
     distance_ratio = runner.current_distance() / max(1, len(integer_indices))
     iteration_ratio = runner.iteration / max(1, runner.max_iterations)
     decision_ratio = min(1.0, runner.decision_count / 10.0)
+    stall_ratio = min(1.0, runner.consecutive_no_change / max(1, runner.stall_threshold))
+    last_flip_ratio = min(1.0, len(runner.last_flip_indices) / max(1, num_candidates))
 
     observation = np.array(
         [
@@ -445,37 +412,83 @@ def build_observation(runner: FeasibilityPumpRunner) -> np.ndarray:
             min(1.0, distance_ratio),
             min(1.0, iteration_ratio),
             decision_ratio,
+            stall_ratio,
+            last_flip_ratio,
         ],
         dtype=np.float32,
     )
-    return observation
+
+    candidate_relaxed = []
+    candidate_distance = []
+    candidate_rounded = []
+
+    for index in candidate_indices[:num_candidates]:
+        candidate_relaxed.append(float(runner.x_list[index]))
+        candidate_distance.append(float(abs(runner.x_list[index] - runner.x_tilde[index])))
+        candidate_rounded.append(float(runner.x_tilde[index]))
+
+    while len(candidate_relaxed) < num_candidates:
+        candidate_relaxed.append(0.0)
+        candidate_distance.append(0.0)
+        candidate_rounded.append(0.0)
+
+    return np.concatenate(
+        [
+            observation,
+            np.array(candidate_relaxed, dtype=np.float32),
+            np.array(candidate_distance, dtype=np.float32),
+            np.array(candidate_rounded, dtype=np.float32),
+        ]
+    )
 
 
-class FeasibilityPumpKEnv(gym.Env):
+class FeasibilityPumpFlipEnv(gym.Env):
+    """
+    PPO acts at every FP iteration.
+
+    Action:
+    - one bit per candidate variable
+    - all zeros means "do not perturb now"
+    - selected bits mean "flip these candidate variables now"
+
+    This single action lets the policy learn:
+    - when to perturb
+    - which variables to flip
+    - how many variables to flip
+    """
     metadata = {"render_modes": []}
 
     def __init__(
         self,
         instance_paths: Sequence[str | Path],
-        k_values: Sequence[int] | None = None,
+        num_candidates: int = DEFAULT_NUM_CANDIDATES,
         max_iterations: int = 100,
-        time_limit: float | None = None,
+        time_limit: float = DEFAULT_TIME_LIMIT,
+        stall_threshold: int = DEFAULT_STALL_THRESHOLD,
     ):
         super().__init__()
 
         self.instance_paths = [str(path) for path in instance_paths]
         if not self.instance_paths:
-            raise ValueError("instance_paths must contain at least one CSV file")
+            raise ValueError("instance_paths must contain at least one .npz file")
 
-        self.k_values = list(k_values or DEFAULT_K_VALUES)
+        self.num_candidates = num_candidates
         self.max_iterations = max_iterations
-        self.time_limit = time_limit
+        self.time_limit = float(time_limit)
+        self.stall_threshold = stall_threshold
 
-        self.action_space = spaces.Discrete(len(self.k_values))
-        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(6,), dtype=np.float32)
+        # Each action bit corresponds to one candidate variable.
+        self.action_space = spaces.MultiBinary(self.num_candidates)
+        self.observation_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(8 + 3 * self.num_candidates,),
+            dtype=np.float32,
+        )
 
         self.problem = None
         self.runner = None
+        self.candidate_indices: list[int] = []
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -494,13 +507,15 @@ class FeasibilityPumpKEnv(gym.Env):
                 problem=self.problem,
                 max_iterations=self.max_iterations,
                 time_limit=self.time_limit,
+                stall_threshold=self.stall_threshold,
             )
             self.runner.reset()
+            self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
 
             if not self.runner.done or requested_path is not None or len(self.instance_paths) == 1:
                 break
 
-        observation = build_observation(self.runner)
+        observation = build_observation(self.runner, self.candidate_indices, self.num_candidates)
         info = self._build_info()
         return observation, info
 
@@ -509,21 +524,40 @@ class FeasibilityPumpKEnv(gym.Env):
             raise RuntimeError("Call reset() before step().")
 
         if self.runner.done:
-            return build_observation(self.runner), 0.0, True, False, self._build_info()
+            return (
+                build_observation(self.runner, self.candidate_indices, self.num_candidates),
+                0.0,
+                True,
+                False,
+                self._build_info(),
+            )
 
-        k = self.k_values[int(action)]
+        action_array = np.asarray(action).reshape(-1)
+        selected_indices = []
+        for position, raw_value in enumerate(action_array[: self.num_candidates]):
+            if position >= len(self.candidate_indices):
+                break
+            if int(raw_value) == 1:
+                selected_indices.append(self.candidate_indices[position])
+
+        num_flips = len(selected_indices)
         previous_distance = self.runner.current_distance()
 
-        self.runner.apply_perturbation(k)
-        self.runner.advance_until_stall_or_done()
+        # All-zero action means "do not perturb now".
+        # Otherwise, flip the selected candidate variables before the next FP solve.
+        self.runner.run_one_iteration(selected_indices)
+        self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
 
         next_distance = self.runner.current_distance()
         reward = previous_distance - next_distance
-        reward -= 0.02 * k
+        reward -= 0.02 * num_flips
         reward -= 0.1
 
-        if k == 0 and self.runner.stalled:
+        if num_flips == 0 and self.runner.is_stalled():
             reward -= 1.0
+
+        if num_flips > 0 and self.runner.last_rounding_changed:
+            reward += 1.0
 
         if self.runner.integer_found:
             reward += 50.0
@@ -532,9 +566,9 @@ class FeasibilityPumpKEnv(gym.Env):
         elif self.runner.done:
             reward -= 5.0
 
-        observation = build_observation(self.runner)
+        observation = build_observation(self.runner, self.candidate_indices, self.num_candidates)
         info = self._build_info()
-        info["k"] = k
+        info["num_flips"] = num_flips
 
         return observation, float(reward), self.runner.done, False, info
 
@@ -546,9 +580,11 @@ class FeasibilityPumpKEnv(gym.Env):
             "instance_path": self.problem.instance_path,
             "iterations": self.runner.iteration,
             "decisions": self.runner.decision_count,
-            "stalled": self.runner.stalled,
+            "stalled": self.runner.is_stalled(),
             "integer_found": self.runner.integer_found,
             "failed": self.runner.failed,
             "distance": self.runner.current_distance(),
-            "last_k": self.runner.last_k,
+            "num_candidates": len(self.candidate_indices),
+            "consecutive_no_change": self.runner.consecutive_no_change,
+            "last_flip_indices": list(self.runner.last_flip_indices),
         }

@@ -8,15 +8,22 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 
-from fp_ppo import DEFAULT_K_VALUES, FeasibilityPumpKEnv
+from fp_ppo import (
+    DEFAULT_NUM_CANDIDATES,
+    DEFAULT_STALL_THRESHOLD,
+    DEFAULT_TIME_LIMIT,
+    FeasibilityPumpFlipEnv,
+)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train PPO to choose the FP perturbation size k.")
+    parser = argparse.ArgumentParser(
+        description="Train PPO to decide when to perturb and which candidate variables to flip from sparse .npz instances."
+    )
     parser.add_argument(
         "--instances",
         required=True,
-        help="Glob pattern for instance files, for example C:/.../instances/*.npz",
+        help="Glob pattern for sparse .npz instances, for example C:/.../instances/*.npz",
     )
     parser.add_argument(
         "--save-path",
@@ -36,9 +43,22 @@ def parse_args():
         help="Maximum FP distance-model solves per episode.",
     )
     parser.add_argument(
-        "--k-values",
-        default="0,2,5,10,15,20",
-        help="Comma-separated list of k actions.",
+        "--num-candidates",
+        type=int,
+        default=DEFAULT_NUM_CANDIDATES,
+        help="How many top candidate variables are exposed to the policy at each decision point.",
+    )
+    parser.add_argument(
+        "--time-limit",
+        type=float,
+        default=DEFAULT_TIME_LIMIT,
+        help="Per-episode time limit in seconds.",
+    )
+    parser.add_argument(
+        "--stall-threshold",
+        type=int,
+        default=DEFAULT_STALL_THRESHOLD,
+        help="How many consecutive no-change FP steps count as a stall in the observation.",
     )
     parser.add_argument(
         "--learning-rate",
@@ -89,27 +109,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def parse_k_values(value: str) -> list[int]:
-    k_values = [int(item.strip()) for item in value.split(",") if item.strip()]
-    if not k_values:
-        return list(DEFAULT_K_VALUES)
-    return k_values
-
-
 def main():
     args = parse_args()
 
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
-        raise FileNotFoundError(f"No instance files matched: {args.instances}")
-
-    k_values = parse_k_values(args.k_values)
+        raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
 
     env = Monitor(
-        FeasibilityPumpKEnv(
+        FeasibilityPumpFlipEnv(
             instance_paths=instance_paths,
-            k_values=k_values,
+            num_candidates=args.num_candidates,
             max_iterations=args.max_iterations,
+            time_limit=args.time_limit,
+            stall_threshold=args.stall_threshold,
         )
     )
 
@@ -120,7 +133,9 @@ def main():
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"Training on {len(instance_paths)} instances")
-    print(f"k actions: {k_values}")
+    print(f"candidate variables per decision: {args.num_candidates}")
+    print(f"time limit per episode: {args.time_limit} seconds")
+    print(f"stall threshold: {args.stall_threshold}")
     print(f"Saving model to: {save_path}")
 
     model = PPO(
