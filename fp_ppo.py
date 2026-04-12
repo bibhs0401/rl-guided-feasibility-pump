@@ -297,7 +297,6 @@ class FeasibilityPumpRunner:
     def reset(self) -> None:
         reset_started = time.time()
         instance_name = Path(self.problem.instance_path).name
-        self.start_time = reset_started
 
         logger.info(
             "Episode %d building FP models for %s (n=%d, m=%d, p=%d)",
@@ -345,6 +344,9 @@ class FeasibilityPumpRunner:
         self.x_tilde = None
         self.y_values = None
 
+        # Match the baseline FP semantics more closely:
+        # the FP time limit starts after model construction.
+        self.start_time = time.time()
         logger.info("Episode %d solving initial LP relaxation for %s", self.episode_index, instance_name)
 
         try:
@@ -685,35 +687,31 @@ class FeasibilityPumpFlipEnv(gym.Env):
         requested_path = None if options is None else options.get("instance_path")
         self.episode_index += 1
 
-        for _ in range(10):
-            if requested_path is not None:
-                chosen_path = requested_path
-            else:
-                chosen_index = int(self.np_random.integers(0, len(self.instance_paths)))
-                chosen_path = self.instance_paths[chosen_index]
+        if requested_path is not None:
+            chosen_path = requested_path
+        else:
+            chosen_index = int(self.np_random.integers(0, len(self.instance_paths)))
+            chosen_path = self.instance_paths[chosen_index]
 
-            logger.info("Episode %d loading %s", self.episode_index, Path(chosen_path).name)
-            load_started = time.time()
-            self.problem = load_problem(chosen_path)
-            self.last_load_seconds = time.time() - load_started
-            logger.info(
-                "Episode %d loaded %s in %.2fs",
-                self.episode_index,
-                Path(chosen_path).name,
-                self.last_load_seconds,
-            )
-            self.runner = FeasibilityPumpRunner(
-                problem=self.problem,
-                max_iterations=self.max_iterations,
-                time_limit=self.time_limit,
-                stall_threshold=self.stall_threshold,
-            )
-            self.runner.episode_index = self.episode_index
-            self.runner.reset()
-            self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
-
-            if not self.runner.done or requested_path is not None or len(self.instance_paths) == 1:
-                break
+        logger.info("Episode %d loading %s", self.episode_index, Path(chosen_path).name)
+        load_started = time.time()
+        self.problem = load_problem(chosen_path)
+        self.last_load_seconds = time.time() - load_started
+        logger.info(
+            "Episode %d loaded %s in %.2fs",
+            self.episode_index,
+            Path(chosen_path).name,
+            self.last_load_seconds,
+        )
+        self.runner = FeasibilityPumpRunner(
+            problem=self.problem,
+            max_iterations=self.max_iterations,
+            time_limit=self.time_limit,
+            stall_threshold=self.stall_threshold,
+        )
+        self.runner.episode_index = self.episode_index
+        self.runner.reset()
+        self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
 
         observation = build_observation(self.runner, self.candidate_indices, self.num_candidates)
         info = self._build_info()
