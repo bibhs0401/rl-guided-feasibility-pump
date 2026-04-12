@@ -19,6 +19,7 @@ DEFAULT_NUM_CANDIDATES = 20
 DEFAULT_TIME_LIMIT = 30.0
 DEFAULT_STALL_THRESHOLD = 3
 DEFAULT_LOG_INTERVAL = 10
+DEFAULT_CPLEX_THREADS = 1
 INTEGER_VARIABLE_FRACTION = 0.8
 INTEGER_TOLERANCE = 1e-6
 
@@ -150,9 +151,14 @@ def iter_vector_entries(vector: Sequence[float]):
         yield int(index), float(array[index])
 
 
-def build_relaxation_model(problem: ProblemData):
+def apply_cplex_threads(model: Model, cplex_threads: int) -> None:
+    # CPLEX uses 0 to mean "automatic".
+    model.context.cplex_parameters.threads = max(0, int(cplex_threads))
+
+
+def build_relaxation_model(problem: ProblemData, cplex_threads: int = DEFAULT_CPLEX_THREADS):
     model = Model(name="fp_relaxation")
-    model.context.cplex_parameters.threads = 1
+    apply_cplex_threads(model, cplex_threads)
 
     x = model.continuous_var_list(problem.n, lb=0, name="x")
     y = model.continuous_var_list(problem.p, name="y")
@@ -174,9 +180,9 @@ def build_relaxation_model(problem: ProblemData):
     return model, x, y
 
 
-def build_distance_model(problem: ProblemData):
+def build_distance_model(problem: ProblemData, cplex_threads: int = DEFAULT_CPLEX_THREADS):
     model = Model(name="fp_distance")
-    model.context.cplex_parameters.threads = 1
+    apply_cplex_threads(model, cplex_threads)
 
     z = model.continuous_var_list(problem.n, lb=0, name="z")
     y = model.continuous_var_list(problem.p, name="y")
@@ -206,8 +212,12 @@ def solve_with_time_limit(model: Model, max_seconds: float | None):
 
 
 def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: float | None = None):
-    solution = solve_with_time_limit(model, max_seconds)
-    if solution is None:
+    # docplex Model.solve() returns True/False (not None) on failure in typical versions.
+    ok = solve_with_time_limit(model, max_seconds)
+    if not ok:
+        status = getattr(model, "solve_status", None)
+        details = getattr(model, "solve_details", None)
+        logger.warning("Relaxation solve failed: status=%s details=%s", status, details)
         return None
 
     x_values = [float(var.solution_value) for var in x_vars]
@@ -231,8 +241,11 @@ def solve_distance_model(
     )
 
     try:
-        solution = solve_with_time_limit(model, max_seconds)
-        if solution is None:
+        ok = solve_with_time_limit(model, max_seconds)
+        if not ok:
+            status = getattr(model, "solve_status", None)
+            details = getattr(model, "solve_details", None)
+            logger.warning("Distance solve failed: status=%s details=%s", status, details)
             return None
 
         x_values = [float(var.solution_value) for var in z_vars]
@@ -249,11 +262,13 @@ class FeasibilityPumpRunner:
         max_iterations: int = 100,
         time_limit: float = DEFAULT_TIME_LIMIT,
         stall_threshold: int = DEFAULT_STALL_THRESHOLD,
+        cplex_threads: int = DEFAULT_CPLEX_THREADS,
     ):
         self.problem = problem
         self.max_iterations = max_iterations
         self.time_limit = float(time_limit)
         self.stall_threshold = stall_threshold
+        self.cplex_threads = int(cplex_threads)
 
         self.relaxation_model = None
         self.relaxation_x = None
@@ -299,20 +314,27 @@ class FeasibilityPumpRunner:
         instance_name = Path(self.problem.instance_path).name
 
         logger.info(
-            "Episode %d building FP models for %s (n=%d, m=%d, p=%d)",
+            "Episode %d building FP models for %s (n=%d, m=%d, p=%d, threads=%d)",
             self.episode_index,
             instance_name,
             self.problem.n,
             self.problem.m,
             self.problem.p,
+            self.cplex_threads,
         )
 
         build_started = time.time()
-        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(self.problem)
+        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
+            self.problem,
+            cplex_threads=self.cplex_threads,
+        )
         self.relaxation_build_seconds = time.time() - build_started
 
         build_started = time.time()
-        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(self.problem)
+        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
+            self.problem,
+            cplex_threads=self.cplex_threads,
+        )
         self.distance_build_seconds = time.time() - build_started
 
         logger.info(
@@ -654,6 +676,7 @@ class FeasibilityPumpFlipEnv(gym.Env):
         max_iterations: int = 100,
         time_limit: float = DEFAULT_TIME_LIMIT,
         stall_threshold: int = DEFAULT_STALL_THRESHOLD,
+        cplex_threads: int = DEFAULT_CPLEX_THREADS,
     ):
         super().__init__()
 
@@ -665,6 +688,7 @@ class FeasibilityPumpFlipEnv(gym.Env):
         self.max_iterations = max_iterations
         self.time_limit = float(time_limit)
         self.stall_threshold = stall_threshold
+        self.cplex_threads = int(cplex_threads)
 
         # Each action bit corresponds to one candidate variable.
         self.action_space = spaces.MultiBinary(self.num_candidates)
@@ -708,6 +732,7 @@ class FeasibilityPumpFlipEnv(gym.Env):
             max_iterations=self.max_iterations,
             time_limit=self.time_limit,
             stall_threshold=self.stall_threshold,
+            cplex_threads=self.cplex_threads,
         )
         self.runner.episode_index = self.episode_index
         self.runner.reset()

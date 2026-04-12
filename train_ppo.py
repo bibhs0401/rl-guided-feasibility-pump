@@ -14,6 +14,7 @@ from stable_baselines3.common.monitor import Monitor
 import torch
 
 from fp_ppo import (
+    DEFAULT_CPLEX_THREADS,
     DEFAULT_NUM_CANDIDATES,
     DEFAULT_STALL_THRESHOLD,
     DEFAULT_TIME_LIMIT,
@@ -142,6 +143,12 @@ def parse_args():
         type=int,
         default=100,
         help="Rolling episode window used by dashboard metrics.",
+    )
+    parser.add_argument(
+        "--cplex-threads",
+        type=int,
+        default=DEFAULT_CPLEX_THREADS,
+        help="Number of CPLEX threads per solve. Use 0 for automatic.",
     )
     return parser.parse_args()
 
@@ -309,6 +316,7 @@ def main():
             max_iterations=args.max_iterations,
             time_limit=args.time_limit,
             stall_threshold=args.stall_threshold,
+            cplex_threads=args.cplex_threads,
         )
     )
 
@@ -322,6 +330,7 @@ def main():
     logger.info("Candidate variables per decision: %d", args.num_candidates)
     logger.info("Time limit per episode: %.1f seconds", args.time_limit)
     logger.info("Stall threshold: %d", args.stall_threshold)
+    logger.info("CPLEX threads per solve: %d", args.cplex_threads)
     logger.info("Using torch device: %s", device)
     logger.info("Saving model to: %s", save_path)
     if args.log_file:

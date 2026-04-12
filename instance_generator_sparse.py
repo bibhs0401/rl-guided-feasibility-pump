@@ -12,11 +12,14 @@ import numpy as np
 from scipy import sparse
 
 
-def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None):
+def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None, n=4000):
     if seed is not None:
         random.seed(seed)
 
-    n = 4000
+    n = int(n)
+    if n < 1:
+        raise ValueError("n must be >= 1")
+
     m = n * 3
     if p is None:
         p = 3
@@ -130,6 +133,12 @@ def parse_args():
         help="Number of y objectives (rows in c matrix)",
     )
     parser.add_argument(
+        "--n",
+        type=int,
+        default=4000,
+        help="Number of decision variables. The number of constraints is set to 3 * n.",
+    )
+    parser.add_argument(
         "--progress-every-rows",
         type=int,
         default=1000,
@@ -152,6 +161,7 @@ if __name__ == "__main__":
             verbose=True,
             progress_every_rows=args.progress_every_rows,
             p=args.p,
+            n=args.n,
         )
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
         print(f"  [save] Writing {path}")
