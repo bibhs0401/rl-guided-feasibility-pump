@@ -816,7 +816,7 @@ class FeasibilityPumpKEnv(gym.Env):
 
         if self.runner.done:
             return (
-                build_observation_k(self.runner, self._instance_features or np.zeros(INSTANCE_FEATURE_DIM), self.k_max),
+                build_observation_k(self.runner, self._instance_features if self._instance_features is not None else np.zeros(INSTANCE_FEATURE_DIM, dtype=np.float32), self.k_max),
                 0.0,
                 True,
                 False,
