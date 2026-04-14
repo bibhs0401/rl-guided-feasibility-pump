@@ -4,18 +4,18 @@ import argparse
 import csv
 import glob
 import logging
+import random
 import sys
 import time
 from pathlib import Path
-
-from stable_baselines3 import PPO
-import torch
 
 from fp_ppo import (
     DEFAULT_CPLEX_THREADS,
     DEFAULT_STALL_THRESHOLD,
     DEFAULT_TIME_LIMIT,
-    FeasibilityPumpKEnv,
+    FeasibilityPumpRunner,
+    load_problem,
+    select_flip_candidates,
 )
 
 
@@ -24,12 +24,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained PPO policy on held-out sparse .npz instances."
-    )
-    parser.add_argument(
-        "--model-path",
-        required=True,
-        help="Path to the saved PPO model (.zip or path prefix).",
+        description="Evaluate a simple classical-FP-style perturbation baseline on sparse .npz instances."
     )
     parser.add_argument(
         "--instances",
@@ -52,7 +47,7 @@ def parse_args():
         "--stall-threshold",
         type=int,
         default=DEFAULT_STALL_THRESHOLD,
-        help="How many consecutive no-change FP steps count as a stall in the observation.",
+        help="How many consecutive no-change FP steps count as a stall.",
     )
     parser.add_argument(
         "--cplex-threads",
@@ -61,10 +56,33 @@ def parse_args():
         help="Number of CPLEX threads per solve. Use 0 for automatic.",
     )
     parser.add_argument(
-        "--device",
-        default="auto",
-        choices=["cuda", "cpu", "auto"],
-        help="Torch device used for PPO inference.",
+        "--flip-k",
+        type=int,
+        default=10,
+        help="How many top disagreement variables to flip when a stall is detected.",
+    )
+    parser.add_argument(
+        "--random-flip-k",
+        action="store_true",
+        help="If set, sample k uniformly from [flip-k-min, flip-k-max] at each perturbation.",
+    )
+    parser.add_argument(
+        "--flip-k-min",
+        type=int,
+        default=5,
+        help="Minimum k when --random-flip-k is enabled.",
+    )
+    parser.add_argument(
+        "--flip-k-max",
+        type=int,
+        default=15,
+        help="Maximum k when --random-flip-k is enabled.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=10,
+        help="Random seed for the optional random-k baseline.",
     )
     parser.add_argument(
         "--limit",
@@ -74,12 +92,12 @@ def parse_args():
     )
     parser.add_argument(
         "--per-instance-csv",
-        default="results/eval_instances.csv",
+        default="results/eval_baseline_instances.csv",
         help="CSV path for per-instance results.",
     )
     parser.add_argument(
         "--summary-csv",
-        default="results/eval_summary.csv",
+        default="results/eval_baseline_summary.csv",
         help="CSV path for aggregate summary results.",
     )
     parser.add_argument(
@@ -112,65 +130,59 @@ def setup_logging(level_name: str, log_file: str | None) -> None:
     )
 
 
-def resolve_device(device_name: str) -> str:
-    if device_name == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return device_name
+def choose_flip_indices(runner: FeasibilityPumpRunner, args) -> list[int]:
+    if not runner.is_stalled():
+        return []
+
+    if args.random_flip_k:
+        flip_k = random.randint(args.flip_k_min, args.flip_k_max)
+    else:
+        flip_k = args.flip_k
+
+    return select_flip_candidates(runner, flip_k)
 
 
-def infer_k_max(model: PPO) -> int:
-    """Return k_max from the model's saved Discrete action space {0, ..., k_max}."""
-    from gymnasium import spaces as gym_spaces
-
-    action_space = model.action_space
-    if not isinstance(action_space, gym_spaces.Discrete):
-        raise ValueError(
-            f"Expected a Discrete action space (choose k flips in {{0,...,k_max}}) "
-            f"but got {type(action_space).__name__}. Load a model trained with FeasibilityPumpKEnv."
-        )
-    # n is the number of actions; valid actions are 0 .. n-1 inclusive.
-    return int(action_space.n) - 1
-
-
-def evaluate_instance(env: FeasibilityPumpKEnv, model: PPO, instance_path: str) -> dict:
+def evaluate_instance(instance_path: str, args) -> dict:
     started = time.time()
-    observation, info = env.reset(options={"instance_path": instance_path})
+    problem = load_problem(instance_path)
+    runner = FeasibilityPumpRunner(
+        problem=problem,
+        max_iterations=args.max_iterations,
+        time_limit=args.time_limit,
+        stall_threshold=args.stall_threshold,
+        cplex_threads=args.cplex_threads,
+    )
+    runner.reset()
 
-    episode_reward = 0.0
-    step_count = 0
-    done = False
-
-    while not done:
-        action, _ = model.predict(observation, deterministic=True)
-        observation, reward, terminated, truncated, info = env.step(action)
-        episode_reward += float(reward)
-        step_count += 1
-        done = bool(terminated or truncated)
+    while not runner.done:
+        was_stalled_before_action = runner.is_stalled()
+        selected_indices = choose_flip_indices(runner, args)
+        if selected_indices and not was_stalled_before_action:
+            runner.off_stall_perturb_steps += 1
+        runner.run_one_iteration(selected_indices)
 
     wall_time_seconds = time.time() - started
 
     result = {
+        "policy_name": "baseline_fp_random_k" if args.random_flip_k else "baseline_fp_topk",
         "instance": Path(instance_path).name,
         "instance_path": instance_path,
-        "integer_found": bool(info.get("integer_found", False)),
-        "failed": bool(info.get("failed", False)),
-        "iterations": int(info.get("iterations", 0)),
-        "decisions": int(info.get("decisions", 0)),
-        "steps_taken": step_count,
-        "perturb_steps": int(info.get("perturb_steps", 0)),
-        "off_stall_perturb_steps": int(info.get("off_stall_perturb_steps", 0)),
-        "no_flip_steps": int(info.get("no_flip_steps", 0)),
-        "total_flips": int(info.get("total_flips", 0)),
-        "stall_events": int(info.get("stall_events", 0)),
-        "stall_recoveries": int(info.get("stall_recoveries", 0)),
-        "final_distance": float(info.get("distance", 0.0)),
-        "load_seconds": float(info.get("load_seconds", 0.0)),
-        "reset_seconds": float(info.get("reset_seconds", 0.0)),
-        "initial_solve_seconds": float(info.get("initial_solve_seconds", 0.0)),
-        "last_distance_solve_seconds": float(info.get("last_distance_solve_seconds", 0.0)),
-        "elapsed_seconds": float(info.get("elapsed_seconds", 0.0)),
+        "integer_found": bool(runner.integer_found),
+        "failed": bool(runner.failed),
+        "iterations": int(runner.iteration),
+        "decisions": int(runner.decision_count),
+        "perturb_steps": int(runner.perturb_steps),
+        "off_stall_perturb_steps": int(runner.off_stall_perturb_steps),
+        "no_flip_steps": int(runner.no_flip_steps),
+        "total_flips": int(runner.total_flips),
+        "stall_events": int(runner.stall_events),
+        "stall_recoveries": int(runner.stall_recoveries),
+        "final_distance": float(runner.current_distance()),
+        "reset_seconds": float(runner.reset_seconds),
+        "initial_solve_seconds": float(runner.relaxation_solve_seconds),
+        "last_distance_solve_seconds": float(runner.last_distance_solve_seconds),
+        "elapsed_seconds": 0.0 if runner.start_time is None else time.time() - runner.start_time,
         "wall_time_seconds": wall_time_seconds,
-        "episode_reward": float(episode_reward),
     }
     return result
 
@@ -194,14 +206,14 @@ def write_csv(path: str | Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def build_summary(results: list[dict], model_path: str, instances_glob: str) -> dict:
+def build_summary(results: list[dict], args) -> dict:
     success_count = sum(1 for result in results if result["integer_found"])
     total_perturb_steps = sum(int(result["perturb_steps"]) for result in results)
     total_off_stall_perturb_steps = sum(int(result["off_stall_perturb_steps"]) for result in results)
 
     return {
-        "model_path": model_path,
-        "instances_glob": instances_glob,
+        "policy_name": "baseline_fp_random_k" if args.random_flip_k else "baseline_fp_topk",
+        "instances_glob": args.instances,
         "num_instances": len(results),
         "num_successes": success_count,
         "success_rate": success_count / max(1, len(results)),
@@ -212,14 +224,17 @@ def build_summary(results: list[dict], model_path: str, instances_glob: str) -> 
         "mean_off_stall_perturb_steps": mean([float(result["off_stall_perturb_steps"]) for result in results]),
         "off_stall_perturb_ratio": total_off_stall_perturb_steps / max(1, total_perturb_steps),
         "mean_total_flips": mean([float(result["total_flips"]) for result in results]),
-        "mean_episode_reward": mean([float(result["episode_reward"]) for result in results]),
+        "flip_k": args.flip_k,
+        "random_flip_k": args.random_flip_k,
+        "flip_k_min": args.flip_k_min,
+        "flip_k_max": args.flip_k_max,
     }
 
 
 def main():
     args = parse_args()
     setup_logging(args.log_level, args.log_file)
-    device = resolve_device(args.device)
+    random.seed(args.seed)
 
     instance_paths = sorted(glob.glob(args.instances))
     if args.limit is not None:
@@ -228,28 +243,17 @@ def main():
     if not instance_paths:
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
 
-    model = PPO.load(args.model_path, device=device)
-    k_max = infer_k_max(model)
-
-    env = FeasibilityPumpKEnv(
-        instance_paths=instance_paths,
-        k_max=k_max,
-        max_iterations=args.max_iterations,
-        time_limit=args.time_limit,
-        stall_threshold=args.stall_threshold,
-        cplex_threads=args.cplex_threads,
-    )
-
-    logger.info("Loaded model from: %s", args.model_path)
-    logger.info("Evaluating on %d held-out instances", len(instance_paths))
-    logger.info("Using k_max=%d from the saved model", k_max)
-    logger.info("Using torch device: %s", device)
+    logger.info("Evaluating baseline on %d held-out instances", len(instance_paths))
     logger.info("Using CPLEX threads per solve: %d", args.cplex_threads)
+    if args.random_flip_k:
+        logger.info("Using random k in [%d, %d]", args.flip_k_min, args.flip_k_max)
+    else:
+        logger.info("Using fixed flip_k=%d", args.flip_k)
 
     results: list[dict] = []
     for index, instance_path in enumerate(instance_paths, start=1):
         logger.info("[%d/%d] Evaluating %s", index, len(instance_paths), Path(instance_path).name)
-        result = evaluate_instance(env, model, instance_path)
+        result = evaluate_instance(instance_path, args)
         results.append(result)
         logger.info(
             "[%d/%d] Result: success=%s iterations=%d time=%.2fs distance=%.4f",
@@ -261,7 +265,7 @@ def main():
             result["final_distance"],
         )
 
-    summary = build_summary(results, args.model_path, args.instances)
+    summary = build_summary(results, args)
     write_csv(args.per_instance_csv, results)
     write_csv(args.summary_csv, [summary])
 

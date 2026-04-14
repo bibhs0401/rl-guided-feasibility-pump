@@ -15,10 +15,10 @@ import torch
 
 from fp_ppo import (
     DEFAULT_CPLEX_THREADS,
-    DEFAULT_NUM_CANDIDATES,
+    DEFAULT_K_MAX,
     DEFAULT_STALL_THRESHOLD,
     DEFAULT_TIME_LIMIT,
-    FeasibilityPumpFlipEnv,
+    FeasibilityPumpKEnv,
 )
 
 
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train PPO to decide when to perturb and which candidate variables to flip from sparse .npz instances."
+        description="Train PPO to choose perturbation size k (flip count) each FP step on sparse .npz instances."
     )
     parser.add_argument(
         "--instances",
@@ -52,10 +52,10 @@ def parse_args():
         help="Maximum FP distance-model solves per episode.",
     )
     parser.add_argument(
-        "--num-candidates",
+        "--k-max",
         type=int,
-        default=DEFAULT_NUM_CANDIDATES,
-        help="How many top candidate variables are exposed to the policy at each decision point.",
+        default=DEFAULT_K_MAX,
+        help="Maximum k the policy may choose; action space is {0,…,k_max} (paper-style flip count).",
     )
     parser.add_argument(
         "--time-limit",
@@ -117,9 +117,11 @@ def parse_args():
     )
     parser.add_argument(
         "--device",
-        default="cuda",
+        default="auto",
         choices=["cuda", "cpu", "auto"],
-        help="Torch device for PPO. Defaults to cuda.",
+        # Bug fix 6: was "cuda" — raised RuntimeError on any CPU-only machine.
+        # "auto" selects CUDA when available and falls back to CPU silently.
+        help="Torch device for PPO. 'auto' picks CUDA if available, else CPU.",
     )
     parser.add_argument(
         "--log-level",
@@ -197,6 +199,7 @@ class TrainingLoggerCallback(BaseCallback):
         self.stall_recovery_history: deque[float] = deque(maxlen=self.rolling_window)
         self.flips_per_step_history: deque[float] = deque(maxlen=self.rolling_window)
         self.no_flip_ratio_history: deque[float] = deque(maxlen=self.rolling_window)
+        self.off_stall_ratio_history: deque[float] = deque(maxlen=self.rolling_window)
         self.solve_seconds_history: deque[float] = deque(maxlen=self.rolling_window)
 
     def _on_training_start(self) -> None:
@@ -220,6 +223,7 @@ class TrainingLoggerCallback(BaseCallback):
             iterations = float(info.get("iterations", 0.0))
             no_flip_steps = float(info.get("no_flip_steps", 0.0))
             perturb_steps = float(info.get("perturb_steps", 0.0))
+            off_stall_perturb_steps = float(info.get("off_stall_perturb_steps", 0.0))
             total_flips = float(info.get("total_flips", 0.0))
             stall_recoveries = float(info.get("stall_recoveries", 0.0))
             stall_events = float(info.get("stall_events", 0.0))
@@ -240,12 +244,16 @@ class TrainingLoggerCallback(BaseCallback):
             elif perturb_steps > 0:
                 self.flips_per_step_history.append(total_flips / perturb_steps)
                 self.no_flip_ratio_history.append(0.0)
+            if perturb_steps > 0:
+                self.off_stall_ratio_history.append(off_stall_perturb_steps / perturb_steps)
+            else:
+                self.off_stall_ratio_history.append(0.0)
 
             instance_name = Path(str(info.get("instance_path", "unknown"))).name
             env_episode = info.get("env_episode", "?")
             logger.info(
                 "Episode %s finished: instance=%s iterations=%s decisions=%s integer_found=%s "
-                "failed=%s distance=%.4f load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
+                "failed=%s distance=%.4f offstall=%s load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
                 env_episode,
                 instance_name,
                 info.get("iterations", "?"),
@@ -253,6 +261,7 @@ class TrainingLoggerCallback(BaseCallback):
                 info.get("integer_found", False),
                 info.get("failed", False),
                 float(info.get("distance", 0.0)),
+                info.get("off_stall_perturb_steps", 0),
                 float(info.get("load_seconds", 0.0)),
                 float(info.get("reset_seconds", 0.0)),
                 float(info.get("last_distance_solve_seconds", 0.0)),
@@ -271,7 +280,8 @@ class TrainingLoggerCallback(BaseCallback):
             if self.success_history:
                 logger.info(
                     "Dashboard t=%d/%d (%.1f%%) | window=%d | sr=%.3f | ret=%.3f | dist=%.3f | "
-                    "fail=%.3f | flips/step=%.3f | noflip=%.3f | stall_recover=%.3f | succ_steps=%.2f | solve_s=%.3f",
+                    "fail=%.3f | flips/step=%.3f | noflip=%.3f | offstall=%.3f | "
+                    "stall_recover=%.3f | succ_steps=%.2f | solve_s=%.3f",
                     self.num_timesteps,
                     self.total_timesteps,
                     progress,
@@ -282,6 +292,7 @@ class TrainingLoggerCallback(BaseCallback):
                     mean_or_nan(self.failure_history),
                     mean_or_nan(self.flips_per_step_history),
                     mean_or_nan(self.no_flip_ratio_history),
+                    mean_or_nan(self.off_stall_ratio_history),
                     mean_or_nan(self.stall_recovery_history),
                     mean_or_nan(self.steps_to_success_history),
                     mean_or_nan(self.solve_seconds_history),
@@ -310,9 +321,9 @@ def main():
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
 
     env = Monitor(
-        FeasibilityPumpFlipEnv(
+        FeasibilityPumpKEnv(
             instance_paths=instance_paths,
-            num_candidates=args.num_candidates,
+            k_max=args.k_max,
             max_iterations=args.max_iterations,
             time_limit=args.time_limit,
             stall_threshold=args.stall_threshold,
@@ -327,7 +338,7 @@ def main():
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Training on %d instances", len(instance_paths))
-    logger.info("Candidate variables per decision: %d", args.num_candidates)
+    logger.info("k_max (max flips per step): %d", args.k_max)
     logger.info("Time limit per episode: %.1f seconds", args.time_limit)
     logger.info("Stall threshold: %d", args.stall_threshold)
     logger.info("CPLEX threads per solve: %d", args.cplex_threads)

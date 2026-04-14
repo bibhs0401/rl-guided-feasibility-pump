@@ -15,11 +15,14 @@ from scipy import sparse
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_NUM_CANDIDATES = 20
+# Maximum number of variables the RL policy may flip in one FP step (action is k in {0,…,k_max}).
+DEFAULT_K_MAX = 20
+INSTANCE_FEATURE_DIM = 16
 DEFAULT_TIME_LIMIT = 30.0
 DEFAULT_STALL_THRESHOLD = 3
 DEFAULT_LOG_INTERVAL = 10
 DEFAULT_CPLEX_THREADS = 1
+DEFAULT_OFF_STALL_PERTURB_PENALTY = 0.25
 INTEGER_VARIABLE_FRACTION = 0.8
 INTEGER_TOLERANCE = 1e-6
 
@@ -73,6 +76,7 @@ def load_problem(instance_path: str | Path) -> ProblemData:
     c_matrix = np.asarray(archive["c"], dtype=float).reshape(p, n)
     d = np.asarray(archive["d"], dtype=float).reshape(p).tolist()
     c = [c_matrix[objective_index].copy() for objective_index in range(p)]
+
     integer_indices = list(range(int(INTEGER_VARIABLE_FRACTION * n)))
 
     return ProblemData(
@@ -291,6 +295,7 @@ class FeasibilityPumpRunner:
         self.total_flips = 0
         self.no_flip_steps = 0
         self.perturb_steps = 0
+        self.off_stall_perturb_steps = 0
         self.stall_events = 0
         self.stall_recoveries = 0
         self._was_stalled_last_step = False
@@ -357,6 +362,7 @@ class FeasibilityPumpRunner:
         self.total_flips = 0
         self.no_flip_steps = 0
         self.perturb_steps = 0
+        self.off_stall_perturb_steps = 0
         self.stall_events = 0
         self.stall_recoveries = 0
         self._was_stalled_last_step = False
@@ -432,13 +438,29 @@ class FeasibilityPumpRunner:
     def is_stalled(self) -> bool:
         return self.consecutive_no_change >= self.stall_threshold
 
-    def run_one_iteration(self, selected_indices: Sequence[int]) -> None:
+    def run_one_iteration(self, selected_indices: Sequence[int]) -> bool:
         if self.done or self.x_tilde is None or self.x_list is None:
-            return
+            return False
 
         instance_name = Path(self.problem.instance_path).name
         previous_distance = self.current_distance()
         num_flips = len(selected_indices)
+
+        # ── Bug fix 1 & 2: guard termination BEFORE mutating state or updating
+        # counters.  Previously x_tilde was flipped and counters incremented even
+        # when the episode was about to exit without solving, leaving x_tilde and
+        # x_list inconsistent and inflating per-episode statistics by one phantom
+        # decision.
+        if self.iteration >= self.max_iterations:
+            self.done = True
+            return False
+
+        remaining_time = self.remaining_time()
+        if remaining_time is not None and remaining_time <= 0:
+            self.done = True
+            return False
+
+        # Safe to update state: we know we will actually run the solve.
         self.decision_count += 1
         self.last_flip_indices = list(selected_indices)
         self.total_flips += num_flips
@@ -450,16 +472,8 @@ class FeasibilityPumpRunner:
         if selected_indices:
             self.x_tilde = flip_selected_variables(self.x_tilde, selected_indices)
 
-        if self.iteration >= self.max_iterations:
-            self.done = True
-            return
-
-        remaining_time = self.remaining_time()
-        if remaining_time is not None and remaining_time <= 0:
-            self.done = True
-            return
-
         should_log_iteration = num_flips > 0
+        self.last_rounding_changed = False
 
         if should_log_iteration:
             logger.debug(
@@ -495,7 +509,7 @@ class FeasibilityPumpRunner:
                 self.iteration,
                 self.last_distance_solve_seconds,
             )
-            return
+            return True
 
         self.x_list, self.y_values, _ = distance_result
 
@@ -509,7 +523,7 @@ class FeasibilityPumpRunner:
                 self.iteration,
                 self.last_distance_solve_seconds,
             )
-            return
+            return True
 
         self.last_rounding_changed = rounding_changed(
             self.x_list,
@@ -520,6 +534,14 @@ class FeasibilityPumpRunner:
         if self.last_rounding_changed:
             self.x_tilde = round_integer_values(self.x_list, self.problem.integer_indices)
             self.consecutive_no_change = 0
+        elif num_flips > 0:
+            # Bug fix 3: we deliberately changed x_tilde via perturbation, so the
+            # "consecutive no-change" streak is broken regardless of whether the LP
+            # solution happens to round back to the flipped target.  Without this
+            # reset, the stall counter keeps growing after every perturbation that
+            # the LP immediately absorbs, causing the agent to see an ever-rising
+            # stall signal even though it is actively perturbing.
+            self.consecutive_no_change = 0
         else:
             self.consecutive_no_change += 1
 
@@ -529,6 +551,12 @@ class FeasibilityPumpRunner:
         if self._was_stalled_last_step and not currently_stalled:
             self.stall_recoveries += 1
         self._was_stalled_last_step = currently_stalled
+
+        remaining_time = self.remaining_time()
+        if self.iteration >= self.max_iterations:
+            self.done = True
+        elif remaining_time is not None and remaining_time <= 0:
+            self.done = True
 
         heartbeat_iteration = self.iteration <= 3 or self.iteration % DEFAULT_LOG_INTERVAL == 0
         should_log_iteration = (
@@ -566,6 +594,8 @@ class FeasibilityPumpRunner:
             else:
                 logger.debug(message, *args)
 
+        return True
+
     def current_distance(self) -> float:
         if self.integer_found:
             return 0.0
@@ -589,17 +619,78 @@ def select_flip_candidates(
     return scored_indices[: min(num_candidates, len(scored_indices))]
 
 
-def build_observation(
+def _three_stats(values: np.ndarray) -> np.ndarray:
+    """Mean / std / max-abs scaled into ~[0, 1] for a coefficient array."""
+    array = np.asarray(values, dtype=np.float64).ravel()
+    if array.size == 0:
+        return np.zeros(3, dtype=np.float32)
+    mean_v = float(np.mean(array))
+    std_v = float(np.std(array))
+    max_abs = float(np.max(np.abs(array)))
+    scale = max(max_abs, 1e-9)
+    return np.array(
+        [
+            float(np.tanh(mean_v / scale) * 0.5 + 0.5),
+            float(min(1.0, std_v / scale)),
+            float(min(1.0, max_abs / (max_abs + 1.0))),
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_instance_features(problem: ProblemData) -> np.ndarray:
+    """Static instance features β (paper-style): size, density, coefficient summaries."""
+    n = float(problem.n)
+    m = float(problem.m)
+    p = float(problem.p)
+    nnz = float(problem.A.nnz)
+    denom = max(1.0, m * n)
+    density = float(min(1.0, nnz / denom))
+    log_cap = np.log1p(100_000.0)
+
+    pieces: list[float] = [
+        float(min(1.0, np.log1p(n) / log_cap)),
+        float(min(1.0, np.log1p(m) / log_cap)),
+        float(min(1.0, np.log1p(p) / log_cap)),
+        density,
+    ]
+    a_data = np.asarray(problem.A.data, dtype=np.float64).ravel()
+    b_vec = np.asarray(problem.b, dtype=np.float64).ravel()
+    if problem.c:
+        c_stack = np.concatenate([np.asarray(row, dtype=np.float64).ravel() for row in problem.c])
+    else:
+        c_stack = np.array([0.0], dtype=np.float64)
+    d_vec = np.asarray(problem.d, dtype=np.float64).ravel()
+
+    pieces.extend(_three_stats(a_data).tolist())
+    pieces.extend(_three_stats(b_vec).tolist())
+    pieces.extend(_three_stats(c_stack).tolist())
+    pieces.extend(_three_stats(d_vec).tolist())
+
+    features = np.asarray(pieces, dtype=np.float32)
+    if features.shape[0] != INSTANCE_FEATURE_DIM:
+        raise RuntimeError(
+            f"INSTANCE_FEATURE_DIM={INSTANCE_FEATURE_DIM} but build_instance_features produced {features.shape[0]}"
+        )
+    return features
+
+
+def build_observation_k(
     runner: FeasibilityPumpRunner,
-    candidate_indices: Sequence[int],
-    num_candidates: int,
+    instance_features: np.ndarray,
+    k_max: int,
 ) -> np.ndarray:
+    """β (static) plus a short dynamic vector from the current FP state."""
+    static = np.asarray(instance_features, dtype=np.float32).reshape(-1)
+    if static.shape[0] != INSTANCE_FEATURE_DIM:
+        raise ValueError(f"Expected {INSTANCE_FEATURE_DIM} static features, got {static.shape[0]}")
+
     if runner.x_list is None or runner.x_tilde is None:
-        return np.zeros(8 + 3 * num_candidates, dtype=np.float32)
+        return np.concatenate([static, np.zeros(8, dtype=np.float32)])
 
     integer_indices = runner.problem.integer_indices
     if not integer_indices:
-        return np.zeros(8 + 3 * num_candidates, dtype=np.float32)
+        return np.concatenate([static, np.zeros(8, dtype=np.float32)])
 
     fractionality = np.array(
         [abs(runner.x_list[index] - round(runner.x_list[index])) for index in integer_indices],
@@ -611,11 +702,11 @@ def build_observation(
     fractional_ratio = float(np.mean(fractionality > INTEGER_TOLERANCE))
     distance_ratio = runner.current_distance() / max(1, len(integer_indices))
     iteration_ratio = runner.iteration / max(1, runner.max_iterations)
-    decision_ratio = min(1.0, runner.decision_count / 10.0)
+    decision_ratio = min(1.0, runner.decision_count / max(1, runner.max_iterations))
     stall_ratio = min(1.0, runner.consecutive_no_change / max(1, runner.stall_threshold))
-    last_flip_ratio = min(1.0, len(runner.last_flip_indices) / max(1, num_candidates))
+    last_k_ratio = min(1.0, len(runner.last_flip_indices) / max(1, k_max))
 
-    observation = np.array(
+    dynamic = np.array(
         [
             min(1.0, mean_fractionality),
             min(1.0, max_fractionality),
@@ -624,55 +715,30 @@ def build_observation(
             min(1.0, iteration_ratio),
             decision_ratio,
             stall_ratio,
-            last_flip_ratio,
+            last_k_ratio,
         ],
         dtype=np.float32,
     )
-
-    candidate_relaxed = []
-    candidate_distance = []
-    candidate_rounded = []
-
-    for index in candidate_indices[:num_candidates]:
-        candidate_relaxed.append(float(runner.x_list[index]))
-        candidate_distance.append(float(abs(runner.x_list[index] - runner.x_tilde[index])))
-        candidate_rounded.append(float(runner.x_tilde[index]))
-
-    while len(candidate_relaxed) < num_candidates:
-        candidate_relaxed.append(0.0)
-        candidate_distance.append(0.0)
-        candidate_rounded.append(0.0)
-
-    return np.concatenate(
-        [
-            observation,
-            np.array(candidate_relaxed, dtype=np.float32),
-            np.array(candidate_distance, dtype=np.float32),
-            np.array(candidate_rounded, dtype=np.float32),
-        ]
-    )
+    return np.concatenate([static, dynamic])
 
 
-class FeasibilityPumpFlipEnv(gym.Env):
+class FeasibilityPumpKEnv(gym.Env):
     """
-    PPO acts at every FP iteration.
+    PPO chooses perturbation size k each FP iteration (ML-paper-style), not a full bitmask.
 
     Action:
-    - one bit per candidate variable
-    - all zeros means "do not perturb now"
-    - selected bits mean "flip these candidate variables now"
+        k in {0, ..., k_max}: flip the k integer coordinates with largest |x_j - x_tilde_j| (ties by index order).
 
-    This single action lets the policy learn:
-    - when to perturb
-    - which variables to flip
-    - how many variables to flip
+    Observation:
+        Normalized instance features (paper-style beta) plus eight dynamic Feasibility Pump statistics.
     """
+
     metadata = {"render_modes": []}
 
     def __init__(
         self,
         instance_paths: Sequence[str | Path],
-        num_candidates: int = DEFAULT_NUM_CANDIDATES,
+        k_max: int = DEFAULT_K_MAX,
         max_iterations: int = 100,
         time_limit: float = DEFAULT_TIME_LIMIT,
         stall_threshold: int = DEFAULT_STALL_THRESHOLD,
@@ -684,24 +750,26 @@ class FeasibilityPumpFlipEnv(gym.Env):
         if not self.instance_paths:
             raise ValueError("instance_paths must contain at least one .npz file")
 
-        self.num_candidates = num_candidates
+        self.k_max = int(k_max)
+        if self.k_max < 0:
+            raise ValueError("k_max must be non-negative")
+
         self.max_iterations = max_iterations
         self.time_limit = float(time_limit)
         self.stall_threshold = stall_threshold
         self.cplex_threads = int(cplex_threads)
 
-        # Each action bit corresponds to one candidate variable.
-        self.action_space = spaces.MultiBinary(self.num_candidates)
+        self.action_space = spaces.Discrete(self.k_max + 1)
         self.observation_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(8 + 3 * self.num_candidates,),
+            shape=(INSTANCE_FEATURE_DIM + 8,),
             dtype=np.float32,
         )
 
         self.problem = None
         self.runner = None
-        self.candidate_indices: list[int] = []
+        self._instance_features: np.ndarray | None = None
         self.episode_index = 0
         self.last_load_seconds = 0.0
 
@@ -727,6 +795,7 @@ class FeasibilityPumpFlipEnv(gym.Env):
             Path(chosen_path).name,
             self.last_load_seconds,
         )
+        self._instance_features = build_instance_features(self.problem)
         self.runner = FeasibilityPumpRunner(
             problem=self.problem,
             max_iterations=self.max_iterations,
@@ -736,9 +805,8 @@ class FeasibilityPumpFlipEnv(gym.Env):
         )
         self.runner.episode_index = self.episode_index
         self.runner.reset()
-        self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
 
-        observation = build_observation(self.runner, self.candidate_indices, self.num_candidates)
+        observation = build_observation_k(self.runner, self._instance_features, self.k_max)
         info = self._build_info()
         return observation, info
 
@@ -748,36 +816,42 @@ class FeasibilityPumpFlipEnv(gym.Env):
 
         if self.runner.done:
             return (
-                build_observation(self.runner, self.candidate_indices, self.num_candidates),
+                build_observation_k(self.runner, self._instance_features or np.zeros(INSTANCE_FEATURE_DIM), self.k_max),
                 0.0,
                 True,
                 False,
                 self._build_info(),
             )
 
-        action_array = np.asarray(action).reshape(-1)
-        selected_indices = []
-        for position, raw_value in enumerate(action_array[: self.num_candidates]):
-            if position >= len(self.candidate_indices):
-                break
-            if int(raw_value) == 1:
-                selected_indices.append(self.candidate_indices[position])
+        k_action = int(np.asarray(action).reshape(-1)[0])
+        k_action = int(np.clip(k_action, 0, self.k_max))
+        selected_indices = select_flip_candidates(self.runner, k_action)
 
         num_flips = len(selected_indices)
         previous_distance = self.runner.current_distance()
+        was_stalled_before_action = self.runner.is_stalled()
 
-        # All-zero action means "do not perturb now".
-        # Otherwise, flip the selected candidate variables before the next FP solve.
-        self.runner.run_one_iteration(selected_indices)
-        self.candidate_indices = select_flip_candidates(self.runner, self.num_candidates)
+        step_executed = self.runner.run_one_iteration(selected_indices)
+        if step_executed and num_flips > 0 and not was_stalled_before_action:
+            self.runner.off_stall_perturb_steps += 1
+
+        if not step_executed:
+            observation = build_observation_k(self.runner, self._instance_features, self.k_max)
+            info = self._build_info()
+            info["num_flips"] = 0
+            info["k_action"] = k_action
+            return observation, 0.0, self.runner.done, False, info
 
         next_distance = self.runner.current_distance()
         reward = previous_distance - next_distance
         reward -= 0.02 * num_flips
         reward -= 0.1
 
-        if num_flips == 0 and self.runner.is_stalled():
+        if num_flips == 0 and was_stalled_before_action:
             reward -= 1.0
+
+        if num_flips > 0 and not was_stalled_before_action:
+            reward -= DEFAULT_OFF_STALL_PERTURB_PENALTY
 
         if num_flips > 0 and self.runner.last_rounding_changed:
             reward += 1.0
@@ -789,11 +863,14 @@ class FeasibilityPumpFlipEnv(gym.Env):
         elif self.runner.done:
             reward -= 5.0
 
-        observation = build_observation(self.runner, self.candidate_indices, self.num_candidates)
+        observation = build_observation_k(self.runner, self._instance_features, self.k_max)
         info = self._build_info()
         info["num_flips"] = num_flips
+        info["k_action"] = k_action
 
-        return observation, float(reward), self.runner.done, False, info
+        terminated = self.runner.integer_found or self.runner.failed
+        truncated = self.runner.done and not terminated
+        return observation, float(reward), terminated, truncated, info
 
     def _build_info(self) -> dict:
         if self.runner is None or self.problem is None:
@@ -802,10 +879,12 @@ class FeasibilityPumpFlipEnv(gym.Env):
         return {
             "env_episode": self.episode_index,
             "instance_path": self.problem.instance_path,
+            "k_max": self.k_max,
             "iterations": self.runner.iteration,
             "decisions": self.runner.decision_count,
             "no_flip_steps": self.runner.no_flip_steps,
             "perturb_steps": self.runner.perturb_steps,
+            "off_stall_perturb_steps": self.runner.off_stall_perturb_steps,
             "total_flips": self.runner.total_flips,
             "stall_events": self.runner.stall_events,
             "stall_recoveries": self.runner.stall_recoveries,
@@ -813,7 +892,6 @@ class FeasibilityPumpFlipEnv(gym.Env):
             "integer_found": self.runner.integer_found,
             "failed": self.runner.failed,
             "distance": self.runner.current_distance(),
-            "num_candidates": len(self.candidate_indices),
             "consecutive_no_change": self.runner.consecutive_no_change,
             "last_flip_indices": list(self.runner.last_flip_indices),
             "load_seconds": self.last_load_seconds,
