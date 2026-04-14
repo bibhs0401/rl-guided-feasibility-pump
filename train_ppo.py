@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import deque
 import glob
 import logging
@@ -152,6 +153,11 @@ def parse_args():
         default=DEFAULT_CPLEX_THREADS,
         help="Number of CPLEX threads per solve. Use 0 for automatic.",
     )
+    parser.add_argument(
+        "--curve-csv",
+        default="results/learning_curve.csv",
+        help="Path for the per-checkpoint learning curve CSV (one row per --progress-log-steps interval).",
+    )
     return parser.parse_args()
 
 
@@ -185,12 +191,14 @@ def resolve_device(device_name: str) -> str:
 
 
 class TrainingLoggerCallback(BaseCallback):
-    def __init__(self, total_timesteps: int, log_every_steps: int, rolling_window: int):
+    def __init__(self, total_timesteps: int, log_every_steps: int, rolling_window: int, curve_csv: str | None = None):
         super().__init__()
         self.total_timesteps = total_timesteps
         self.log_every_steps = max(1, log_every_steps)
         self.next_progress_log = self.log_every_steps
         self.rolling_window = max(1, rolling_window)
+        self.curve_csv = curve_csv
+        self._curve_rows: list[dict] = []
         self.success_history: deque[float] = deque(maxlen=self.rolling_window)
         self.return_history: deque[float] = deque(maxlen=self.rolling_window)
         self.final_distance_history: deque[float] = deque(maxlen=self.rolling_window)
@@ -297,6 +305,20 @@ class TrainingLoggerCallback(BaseCallback):
                     mean_or_nan(self.steps_to_success_history),
                     mean_or_nan(self.solve_seconds_history),
                 )
+                self._curve_rows.append({
+                    "timestep": self.num_timesteps,
+                    "episodes_in_window": len(self.success_history),
+                    "success_rate": mean_or_nan(self.success_history),
+                    "mean_return": mean_or_nan(self.return_history),
+                    "mean_final_distance": mean_or_nan(self.final_distance_history),
+                    "failure_rate": mean_or_nan(self.failure_history),
+                    "mean_flips_per_step": mean_or_nan(self.flips_per_step_history),
+                    "mean_no_flip_ratio": mean_or_nan(self.no_flip_ratio_history),
+                    "mean_off_stall_ratio": mean_or_nan(self.off_stall_ratio_history),
+                    "mean_stall_recovery_rate": mean_or_nan(self.stall_recovery_history),
+                    "mean_steps_to_success": mean_or_nan(self.steps_to_success_history),
+                    "mean_solve_seconds": mean_or_nan(self.solve_seconds_history),
+                })
             else:
                 logger.info(
                     "Dashboard t=%d/%d (%.1f%%) | waiting for completed episodes",
@@ -309,6 +331,14 @@ class TrainingLoggerCallback(BaseCallback):
 
     def _on_training_end(self) -> None:
         logger.info("SB3 training loop finished")
+        if self.curve_csv and self._curve_rows:
+            curve_path = Path(self.curve_csv)
+            curve_path.parent.mkdir(parents=True, exist_ok=True)
+            with curve_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(self._curve_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(self._curve_rows)
+            logger.info("Learning curve written to: %s (%d rows)", curve_path, len(self._curve_rows))
 
 
 def main():
@@ -366,6 +396,7 @@ def main():
         total_timesteps=args.total_timesteps,
         log_every_steps=args.progress_log_steps,
         rolling_window=args.dashboard_window,
+        curve_csv=args.curve_csv,
     )
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
     model.save(str(save_path))
