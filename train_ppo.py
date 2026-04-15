@@ -7,6 +7,7 @@ from datetime import datetime
 import glob
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
 import torch
 
 from fp_ppo import (
@@ -171,6 +173,19 @@ def parse_args():
         default="results/learning_curve.csv",
         help="Path for the per-checkpoint learning curve CSV (one row per --progress-log-steps interval).",
     )
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of parallel environments for training (uses SubprocVecEnv when >1).",
+    )
+    parser.add_argument(
+        "--vec-start-method",
+        type=str,
+        default="auto",
+        choices=["auto", "fork", "spawn", "forkserver"],
+        help="Multiprocessing start method for SubprocVecEnv. 'auto' uses fork on POSIX and spawn on Windows.",
+    )
     return parser.parse_args()
 
 
@@ -216,6 +231,34 @@ def parse_k_choices(raw: str) -> tuple[int, ...]:
     if any(k <= 0 for k in values):
         raise ValueError("--k-choices must contain strictly positive integers")
     return tuple(values)
+
+
+def make_env_factory(
+    instance_paths: list[str],
+    k_choices: tuple[int, ...],
+    max_iterations: int,
+    time_limit: float,
+    stall_threshold: int,
+    cplex_threads: int,
+):
+    def _init():
+        env = FeasibilityPumpKEnv(
+            instance_paths=instance_paths,
+            k_choices=k_choices,
+            max_iterations=max_iterations,
+            time_limit=time_limit,
+            stall_threshold=stall_threshold,
+            cplex_threads=cplex_threads,
+        )
+        return Monitor(env)
+
+    return _init
+
+
+def resolve_vec_start_method(method: str) -> str:
+    if method != "auto":
+        return method
+    return "fork" if os.name == "posix" else "spawn"
 
 
 class TrainingLoggerCallback(BaseCallback):
@@ -378,6 +421,9 @@ def main():
     setup_logging(args.log_level, args.log_file)
     device = resolve_device(args.device)
     k_choices = parse_k_choices(args.k_choices)
+    if args.num_envs < 1:
+        raise ValueError("--num-envs must be >= 1")
+    vec_start_method = resolve_vec_start_method(args.vec_start_method)
 
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
@@ -394,7 +440,7 @@ def main():
     summary_csv_path = run_dir / "run_summary.csv"
     args_json_path = run_dir / "run_args.json"
 
-    env = Monitor(
+    single_env = Monitor(
         FeasibilityPumpKEnv(
             instance_paths=instance_paths,
             k_choices=k_choices,
@@ -404,9 +450,26 @@ def main():
             cplex_threads=args.cplex_threads,
         )
     )
+    env = single_env
 
     if args.check_env:
-        check_env(env.unwrapped, warn=True)
+        check_env(single_env.unwrapped, warn=True)
+
+    if args.num_envs > 1:
+        env = SubprocVecEnv(
+            [
+                make_env_factory(
+                    instance_paths=instance_paths,
+                    k_choices=k_choices,
+                    max_iterations=args.max_iterations,
+                    time_limit=args.time_limit,
+                    stall_threshold=args.stall_threshold,
+                    cplex_threads=args.cplex_threads,
+                )
+                for _ in range(args.num_envs)
+            ],
+            start_method=vec_start_method,
+        )
 
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -415,6 +478,9 @@ def main():
     logger.info("k choices: %s", list(k_choices))
     logger.info("Time limit per episode: %.1f seconds", args.time_limit)
     logger.info("Stall threshold: %d", args.stall_threshold)
+    logger.info("Parallel environments: %d", args.num_envs)
+    if args.num_envs > 1:
+        logger.info("SubprocVecEnv start method: %s", vec_start_method)
     logger.info("CPLEX threads per solve: %d", args.cplex_threads)
     logger.info("Using torch device: %s", device)
     logger.info("Saving model to: %s", model_save_path)
