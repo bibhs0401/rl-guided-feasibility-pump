@@ -140,10 +140,20 @@ def parse_args():
     parser.add_argument(
         "--n",
         type=int,
-        default=4000,
+        default=None,
         help=(
-            "Number of decision variables. "
+            "Fixed number of decision variables (overrides --random-n). "
             "The number of constraints is set to 2 * n."
+        ),
+    )
+    parser.add_argument(
+        "--random-n",
+        action="store_true",
+        default=True,
+        help=(
+            "Pick n independently for each instance from {300, 400, ..., 1000} "
+            "(paper: 'randomly from the integer set ranging from 300 to 1000, by 100'). "
+            "Ignored when --n is set explicitly."
         ),
     )
     parser.add_argument(
@@ -160,18 +170,24 @@ if __name__ == "__main__":
     out_dir = args.out_dir
     random.seed(args.seed)
 
+    # Paper: n randomly selected from {300, 400, 500, 600, 700, 800, 900, 1000}.
+    # --n overrides this; otherwise --random-n (default True) applies.
+    N_CHOICES = list(range(300, 1001, 100))
+    use_random_n = (args.n is None)
+
     print(
         f"Starting generation: instances={args.num_instances}, seed={args.seed}, p={args.p}, "
-        f"n={args.n}, out_dir={out_dir}"
+        f"n={'random from {300..1000}' if use_random_n else args.n}, out_dir={out_dir}"
     )
     for i in range(args.num_instances):
-        print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz  (n={args.n})")
+        n_i = random.choice(N_CHOICES) if use_random_n else args.n
+        print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz  (n={n_i})")
         t0 = time.time()
         inst = generate_instance(
             verbose=True,
             progress_every_rows=args.progress_every_rows,
             p=args.p,
-            n=args.n,
+            n=n_i,
         )
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
         print(f"  [save] Writing {path}")

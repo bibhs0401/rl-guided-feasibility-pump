@@ -34,10 +34,10 @@ python .\train_ppo.py `
 Each training run is saved in its own folder:
 
 - `runs/train_ppo/<run_name>/model.zip`
-- `runs/train_ppo/<run_name>/learning_curve.csv`
+- `runs/train_ppo/<run_name>/learning_curve_m..._n....csv`
 - `runs/train_ppo/<run_name>/run_args.json`
 - `runs/train_ppo/<run_name>/run_summary.json`
-- `runs/train_ppo/<run_name>/run_summary.csv`
+- `runs/train_ppo/<run_name>/run_summary_m..._n....csv`
 
 If `--run-name` is omitted, a timestamped name is generated automatically.
 You can still pass `--save-path` and `--curve-csv` to override default output locations.
@@ -62,8 +62,8 @@ python .\evaluate_ppo.py `
 
 Each evaluation run is saved in its own folder:
 
-- `runs/eval_ppo/<run_name>/eval_instances.csv`
-- `runs/eval_ppo/<run_name>/eval_summary.csv`
+- `runs/eval_ppo/<run_name>/eval_instances_m..._n....csv`
+- `runs/eval_ppo/<run_name>/eval_summary_m..._n....csv`
 
 If `--run-name` is omitted, a timestamped name is generated automatically.
 You can still pass `--per-instance-csv` and `--summary-csv` to override default output locations.
