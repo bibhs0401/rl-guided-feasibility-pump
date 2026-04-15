@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.env_checker import check_env
@@ -170,8 +171,8 @@ def parse_args():
     )
     parser.add_argument(
         "--curve-csv",
-        default="results/learning_curve.csv",
-        help="Path for the per-checkpoint learning curve CSV (one row per --progress-log-steps interval).",
+        default=None,
+        help="Optional path for per-checkpoint learning curve CSV. Defaults to <run_dir>/learning_curve_<m,n>.csv.",
     )
     parser.add_argument(
         "--num-envs",
@@ -259,6 +260,37 @@ def resolve_vec_start_method(method: str) -> str:
     if method != "auto":
         return method
     return "fork" if os.name == "posix" else "spawn"
+
+
+def _read_scalar(value) -> int:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        return int(float(array.item()))
+    return int(float(array.reshape(-1)[0]))
+
+
+def infer_instance_shape_tag(instance_paths: list[str]) -> str:
+    if not instance_paths:
+        return "mNA_nNA"
+
+    m_values: list[int] = []
+    n_values: list[int] = []
+    for instance_path in instance_paths:
+        try:
+            with np.load(instance_path, allow_pickle=False) as archive:
+                m_values.append(_read_scalar(archive["m"]))
+                n_values.append(_read_scalar(archive["n"]))
+        except Exception:
+            logger.warning("Could not read m/n metadata from %s", instance_path)
+
+    if not m_values or not n_values:
+        return "mNA_nNA"
+
+    min_m, max_m = min(m_values), max(m_values)
+    min_n, max_n = min(n_values), max(n_values)
+    if min_m == max_m and min_n == max_n:
+        return f"m{min_m}_n{min_n}"
+    return f"m{min_m}-{max_m}_n{min_n}-{max_n}"
 
 
 class TrainingLoggerCallback(BaseCallback):
@@ -428,6 +460,7 @@ def main():
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
+    shape_tag = infer_instance_shape_tag(instance_paths)
 
     run_started = time.time()
     run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
@@ -435,9 +468,9 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     model_save_path = Path(args.save_path) if args.save_path else (run_dir / "model")
-    curve_csv_path = Path(args.curve_csv) if args.curve_csv else (run_dir / "learning_curve.csv")
+    curve_csv_path = Path(args.curve_csv) if args.curve_csv else (run_dir / f"learning_curve_{shape_tag}.csv")
     summary_json_path = run_dir / "run_summary.json"
-    summary_csv_path = run_dir / "run_summary.csv"
+    summary_csv_path = run_dir / f"run_summary_{shape_tag}.csv"
     args_json_path = run_dir / "run_args.json"
 
     single_env = Monitor(
@@ -474,6 +507,7 @@ def main():
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Training on %d instances", len(instance_paths))
+    logger.info("Instance shape tag: %s", shape_tag)
     logger.info("Run directory: %s", run_dir)
     logger.info("k choices: %s", list(k_choices))
     logger.info("Time limit per episode: %.1f seconds", args.time_limit)

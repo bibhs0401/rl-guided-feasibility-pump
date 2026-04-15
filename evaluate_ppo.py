@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from stable_baselines3 import PPO
 import torch
 
@@ -166,6 +167,37 @@ def validate_action_mapping(model: PPO, k_choices: tuple[int, ...]) -> None:
         )
 
 
+def _read_scalar(value) -> int:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        return int(float(array.item()))
+    return int(float(array.reshape(-1)[0]))
+
+
+def infer_instance_shape_tag(instance_paths: list[str]) -> str:
+    if not instance_paths:
+        return "mNA_nNA"
+
+    m_values: list[int] = []
+    n_values: list[int] = []
+    for instance_path in instance_paths:
+        try:
+            with np.load(instance_path, allow_pickle=False) as archive:
+                m_values.append(_read_scalar(archive["m"]))
+                n_values.append(_read_scalar(archive["n"]))
+        except Exception:
+            logger.warning("Could not read m/n metadata from %s", instance_path)
+
+    if not m_values or not n_values:
+        return "mNA_nNA"
+
+    min_m, max_m = min(m_values), max(m_values)
+    min_n, max_n = min(n_values), max(n_values)
+    if min_m == max_m and min_n == max_n:
+        return f"m{min_m}_n{min_n}"
+    return f"m{min_m}-{max_m}_n{min_n}-{max_n}"
+
+
 def evaluate_instance(env: FeasibilityPumpKEnv, model: PPO, instance_path: str) -> dict:
     started = time.time()
     observation, info = env.reset(options={"instance_path": instance_path})
@@ -256,12 +288,17 @@ def main():
 
     if not instance_paths:
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
+    shape_tag = infer_instance_shape_tag(instance_paths)
 
     run_name = args.run_name or datetime.now().strftime("eval_%Y%m%d_%H%M%S")
     run_dir = Path(args.runs_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-    per_instance_csv = Path(args.per_instance_csv) if args.per_instance_csv else (run_dir / "eval_instances.csv")
-    summary_csv = Path(args.summary_csv) if args.summary_csv else (run_dir / "eval_summary.csv")
+    per_instance_csv = (
+        Path(args.per_instance_csv)
+        if args.per_instance_csv
+        else (run_dir / f"eval_instances_{shape_tag}.csv")
+    )
+    summary_csv = Path(args.summary_csv) if args.summary_csv else (run_dir / f"eval_summary_{shape_tag}.csv")
 
     model = PPO.load(args.model_path, device=device)
     validate_action_mapping(model, k_choices)
@@ -277,6 +314,7 @@ def main():
 
     logger.info("Loaded model from: %s", args.model_path)
     logger.info("Evaluating on %d held-out instances", len(instance_paths))
+    logger.info("Instance shape tag: %s", shape_tag)
     logger.info("Evaluation run directory: %s", run_dir)
     logger.info("Using k choices: %s", list(k_choices))
     logger.info("Using torch device: %s", device)
