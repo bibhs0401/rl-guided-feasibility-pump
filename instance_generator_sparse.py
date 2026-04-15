@@ -20,7 +20,7 @@ def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None
     if n < 1:
         raise ValueError("n must be >= 1")
 
-    m = n * 3
+    m = n * 2
     if p is None:
         p = 3
     else:
@@ -52,9 +52,14 @@ def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None
         print("  [generate] A matrix done")
 
     # --- b vector ---
-    sparsity = n - np.diff(A.indptr)  # zeros per row
-    b = np.array([random.randint(int(sparsity[i]) + 1, int(10 * sparsity[i]) + 1)
-                  for i in range(m)], dtype=np.float32)
+    # Paper formula: b[i] ~ Uniform[ns_A, 10 * ns_A] where ns_A is the expected
+    # number of NON-ZERO elements per row.
+    # Bug in original code: used (n - nnz) = zero count instead of nnz per row.
+    nnz_per_row = np.diff(A.indptr)  # actual non-zero count per row = ns_A
+    b = np.array([
+        random.randint(int(nnz_per_row[i]), int(10 * nnz_per_row[i]) + 1)
+        for i in range(m)
+    ], dtype=np.float32)
     if verbose:
         print("  [generate] b vector done")
 
@@ -136,7 +141,10 @@ def parse_args():
         "--n",
         type=int,
         default=4000,
-        help="Number of decision variables. The number of constraints is set to 3 * n.",
+        help=(
+            "Number of decision variables. "
+            "The number of constraints is set to 2 * n."
+        ),
     )
     parser.add_argument(
         "--progress-every-rows",
@@ -151,11 +159,13 @@ if __name__ == "__main__":
     args = parse_args()
     out_dir = args.out_dir
     random.seed(args.seed)
+
     print(
-        f"Starting generation: instances={args.num_instances}, seed={args.seed}, p={args.p}, out_dir={out_dir}"
+        f"Starting generation: instances={args.num_instances}, seed={args.seed}, p={args.p}, "
+        f"n={args.n}, out_dir={out_dir}"
     )
     for i in range(args.num_instances):
-        print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz")
+        print(f"\n[{i+1}/{args.num_instances}] Generating instance_{i+1}.npz  (n={args.n})")
         t0 = time.time()
         inst = generate_instance(
             verbose=True,

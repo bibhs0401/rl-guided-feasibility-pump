@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 import glob
 import logging
 import sys
@@ -13,6 +14,7 @@ import torch
 
 from fp_ppo import (
     DEFAULT_CPLEX_THREADS,
+    DEFAULT_K_CHOICES,
     DEFAULT_STALL_THRESHOLD,
     DEFAULT_TIME_LIMIT,
     FeasibilityPumpKEnv,
@@ -67,20 +69,36 @@ def parse_args():
         help="Torch device used for PPO inference.",
     )
     parser.add_argument(
+        "--k-choices",
+        type=str,
+        default=",".join(str(k) for k in DEFAULT_K_CHOICES),
+        help="Comma-separated perturbation sizes used by the trained model action mapping.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
         help="Optional cap on the number of held-out instances to evaluate.",
     )
     parser.add_argument(
+        "--runs-dir",
+        default="runs/eval_ppo",
+        help="Base directory where each evaluation run gets its own timestamped folder.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional evaluation run folder name. If omitted, a timestamped name is generated.",
+    )
+    parser.add_argument(
         "--per-instance-csv",
-        default="results/eval_instances.csv",
-        help="CSV path for per-instance results.",
+        default=None,
+        help="Optional CSV path for per-instance results. Defaults to <run_dir>/eval_instances.csv.",
     )
     parser.add_argument(
         "--summary-csv",
-        default="results/eval_summary.csv",
-        help="CSV path for aggregate summary results.",
+        default=None,
+        help="Optional CSV path for aggregate summary results. Defaults to <run_dir>/eval_summary.csv.",
     )
     parser.add_argument(
         "--log-level",
@@ -118,18 +136,34 @@ def resolve_device(device_name: str) -> str:
     return device_name
 
 
-def infer_k_max(model: PPO) -> int:
-    """Return k_max from the model's saved Discrete action space {0, ..., k_max}."""
+def parse_k_choices(raw: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in raw.split(","):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        values.append(int(stripped))
+
+    if not values:
+        raise ValueError("--k-choices must include at least one integer")
+    if any(k <= 0 for k in values):
+        raise ValueError("--k-choices must contain strictly positive integers")
+    return tuple(values)
+
+
+def validate_action_mapping(model: PPO, k_choices: tuple[int, ...]) -> None:
     from gymnasium import spaces as gym_spaces
 
     action_space = model.action_space
     if not isinstance(action_space, gym_spaces.Discrete):
         raise ValueError(
-            f"Expected a Discrete action space (choose k flips in {{0,...,k_max}}) "
+            f"Expected a Discrete action space (choose a k-choice index) "
             f"but got {type(action_space).__name__}. Load a model trained with FeasibilityPumpKEnv."
         )
-    # n is the number of actions; valid actions are 0 .. n-1 inclusive.
-    return int(action_space.n) - 1
+    if int(action_space.n) != len(k_choices):
+        raise ValueError(
+            f"Model action space has {int(action_space.n)} actions, but --k-choices has {len(k_choices)} values."
+        )
 
 
 def evaluate_instance(env: FeasibilityPumpKEnv, model: PPO, instance_path: str) -> dict:
@@ -158,8 +192,6 @@ def evaluate_instance(env: FeasibilityPumpKEnv, model: PPO, instance_path: str) 
         "decisions": int(info.get("decisions", 0)),
         "steps_taken": step_count,
         "perturb_steps": int(info.get("perturb_steps", 0)),
-        "off_stall_perturb_steps": int(info.get("off_stall_perturb_steps", 0)),
-        "no_flip_steps": int(info.get("no_flip_steps", 0)),
         "total_flips": int(info.get("total_flips", 0)),
         "stall_events": int(info.get("stall_events", 0)),
         "stall_recoveries": int(info.get("stall_recoveries", 0)),
@@ -196,8 +228,6 @@ def write_csv(path: str | Path, rows: list[dict]) -> None:
 
 def build_summary(results: list[dict], model_path: str, instances_glob: str) -> dict:
     success_count = sum(1 for result in results if result["integer_found"])
-    total_perturb_steps = sum(int(result["perturb_steps"]) for result in results)
-    total_off_stall_perturb_steps = sum(int(result["off_stall_perturb_steps"]) for result in results)
 
     return {
         "model_path": model_path,
@@ -209,8 +239,6 @@ def build_summary(results: list[dict], model_path: str, instances_glob: str) -> 
         "mean_time_seconds": mean([float(result["wall_time_seconds"]) for result in results]),
         "mean_final_distance": mean([float(result["final_distance"]) for result in results]),
         "mean_perturb_steps": mean([float(result["perturb_steps"]) for result in results]),
-        "mean_off_stall_perturb_steps": mean([float(result["off_stall_perturb_steps"]) for result in results]),
-        "off_stall_perturb_ratio": total_off_stall_perturb_steps / max(1, total_perturb_steps),
         "mean_total_flips": mean([float(result["total_flips"]) for result in results]),
         "mean_episode_reward": mean([float(result["episode_reward"]) for result in results]),
     }
@@ -220,6 +248,7 @@ def main():
     args = parse_args()
     setup_logging(args.log_level, args.log_file)
     device = resolve_device(args.device)
+    k_choices = parse_k_choices(args.k_choices)
 
     instance_paths = sorted(glob.glob(args.instances))
     if args.limit is not None:
@@ -228,12 +257,18 @@ def main():
     if not instance_paths:
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
 
+    run_name = args.run_name or datetime.now().strftime("eval_%Y%m%d_%H%M%S")
+    run_dir = Path(args.runs_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    per_instance_csv = Path(args.per_instance_csv) if args.per_instance_csv else (run_dir / "eval_instances.csv")
+    summary_csv = Path(args.summary_csv) if args.summary_csv else (run_dir / "eval_summary.csv")
+
     model = PPO.load(args.model_path, device=device)
-    k_max = infer_k_max(model)
+    validate_action_mapping(model, k_choices)
 
     env = FeasibilityPumpKEnv(
         instance_paths=instance_paths,
-        k_max=k_max,
+        k_choices=k_choices,
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
         stall_threshold=args.stall_threshold,
@@ -242,7 +277,8 @@ def main():
 
     logger.info("Loaded model from: %s", args.model_path)
     logger.info("Evaluating on %d held-out instances", len(instance_paths))
-    logger.info("Using k_max=%d from the saved model", k_max)
+    logger.info("Evaluation run directory: %s", run_dir)
+    logger.info("Using k choices: %s", list(k_choices))
     logger.info("Using torch device: %s", device)
     logger.info("Using CPLEX threads per solve: %d", args.cplex_threads)
 
@@ -262,11 +298,11 @@ def main():
         )
 
     summary = build_summary(results, args.model_path, args.instances)
-    write_csv(args.per_instance_csv, results)
-    write_csv(args.summary_csv, [summary])
+    write_csv(per_instance_csv, results)
+    write_csv(summary_csv, [summary])
 
-    logger.info("Wrote per-instance results to: %s", args.per_instance_csv)
-    logger.info("Wrote summary results to: %s", args.summary_csv)
+    logger.info("Wrote per-instance results to: %s", per_instance_csv)
+    logger.info("Wrote summary results to: %s", summary_csv)
     logger.info(
         "Summary: success_rate=%.3f mean_iterations=%.2f mean_time=%.2fs",
         summary["success_rate"],

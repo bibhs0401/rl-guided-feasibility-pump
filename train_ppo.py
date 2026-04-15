@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import deque
+from datetime import datetime
 import glob
+import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from stable_baselines3 import PPO
@@ -16,7 +19,7 @@ import torch
 
 from fp_ppo import (
     DEFAULT_CPLEX_THREADS,
-    DEFAULT_K_MAX,
+    DEFAULT_K_CHOICES,
     DEFAULT_STALL_THRESHOLD,
     DEFAULT_TIME_LIMIT,
     FeasibilityPumpKEnv,
@@ -36,9 +39,19 @@ def parse_args():
         help="Glob pattern for sparse .npz instances, for example C:/.../instances/*.npz",
     )
     parser.add_argument(
+        "--runs-dir",
+        default="runs/train_ppo",
+        help="Base directory where each run gets its own timestamped folder.",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="Optional run folder name. If omitted, a timestamped name is generated.",
+    )
+    parser.add_argument(
         "--save-path",
-        default="models/ppo_fp_k",
-        help="Path prefix for the saved PPO model.",
+        default=None,
+        help="Optional explicit model path/prefix. If omitted, model is saved under the run folder.",
     )
     parser.add_argument(
         "--total-timesteps",
@@ -53,10 +66,10 @@ def parse_args():
         help="Maximum FP distance-model solves per episode.",
     )
     parser.add_argument(
-        "--k-max",
-        type=int,
-        default=DEFAULT_K_MAX,
-        help="Maximum k the policy may choose; action space is {0,…,k_max} (paper-style flip count).",
+        "--k-choices",
+        type=str,
+        default=",".join(str(k) for k in DEFAULT_K_CHOICES),
+        help="Comma-separated perturbation sizes used as discrete actions, e.g. 1,2,5,10,20,50.",
     )
     parser.add_argument(
         "--time-limit",
@@ -190,6 +203,21 @@ def resolve_device(device_name: str) -> str:
     return device_name
 
 
+def parse_k_choices(raw: str) -> tuple[int, ...]:
+    values: list[int] = []
+    for token in raw.split(","):
+        stripped = token.strip()
+        if not stripped:
+            continue
+        values.append(int(stripped))
+
+    if not values:
+        raise ValueError("--k-choices must include at least one integer")
+    if any(k <= 0 for k in values):
+        raise ValueError("--k-choices must contain strictly positive integers")
+    return tuple(values)
+
+
 class TrainingLoggerCallback(BaseCallback):
     def __init__(self, total_timesteps: int, log_every_steps: int, rolling_window: int, curve_csv: str | None = None):
         super().__init__()
@@ -206,8 +234,6 @@ class TrainingLoggerCallback(BaseCallback):
         self.steps_to_success_history: deque[float] = deque(maxlen=self.rolling_window)
         self.stall_recovery_history: deque[float] = deque(maxlen=self.rolling_window)
         self.flips_per_step_history: deque[float] = deque(maxlen=self.rolling_window)
-        self.no_flip_ratio_history: deque[float] = deque(maxlen=self.rolling_window)
-        self.off_stall_ratio_history: deque[float] = deque(maxlen=self.rolling_window)
         self.solve_seconds_history: deque[float] = deque(maxlen=self.rolling_window)
 
     def _on_training_start(self) -> None:
@@ -229,9 +255,7 @@ class TrainingLoggerCallback(BaseCallback):
             failed = bool(info.get("failed", False))
             final_distance = float(info.get("distance", 0.0))
             iterations = float(info.get("iterations", 0.0))
-            no_flip_steps = float(info.get("no_flip_steps", 0.0))
             perturb_steps = float(info.get("perturb_steps", 0.0))
-            off_stall_perturb_steps = float(info.get("off_stall_perturb_steps", 0.0))
             total_flips = float(info.get("total_flips", 0.0))
             stall_recoveries = float(info.get("stall_recoveries", 0.0))
             stall_events = float(info.get("stall_events", 0.0))
@@ -248,20 +272,14 @@ class TrainingLoggerCallback(BaseCallback):
                 self.stall_recovery_history.append(stall_recoveries / stall_events)
             if iterations > 0:
                 self.flips_per_step_history.append(total_flips / iterations)
-                self.no_flip_ratio_history.append(no_flip_steps / iterations)
             elif perturb_steps > 0:
                 self.flips_per_step_history.append(total_flips / perturb_steps)
-                self.no_flip_ratio_history.append(0.0)
-            if perturb_steps > 0:
-                self.off_stall_ratio_history.append(off_stall_perturb_steps / perturb_steps)
-            else:
-                self.off_stall_ratio_history.append(0.0)
 
             instance_name = Path(str(info.get("instance_path", "unknown"))).name
             env_episode = info.get("env_episode", "?")
             logger.info(
                 "Episode %s finished: instance=%s iterations=%s decisions=%s integer_found=%s "
-                "failed=%s distance=%.4f offstall=%s load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
+                "failed=%s distance=%.4f load=%.2fs reset=%.2fs last_solve=%.2fs elapsed=%.2fs",
                 env_episode,
                 instance_name,
                 info.get("iterations", "?"),
@@ -269,7 +287,6 @@ class TrainingLoggerCallback(BaseCallback):
                 info.get("integer_found", False),
                 info.get("failed", False),
                 float(info.get("distance", 0.0)),
-                info.get("off_stall_perturb_steps", 0),
                 float(info.get("load_seconds", 0.0)),
                 float(info.get("reset_seconds", 0.0)),
                 float(info.get("last_distance_solve_seconds", 0.0)),
@@ -288,7 +305,7 @@ class TrainingLoggerCallback(BaseCallback):
             if self.success_history:
                 logger.info(
                     "Dashboard t=%d/%d (%.1f%%) | window=%d | sr=%.3f | ret=%.3f | dist=%.3f | "
-                    "fail=%.3f | flips/step=%.3f | noflip=%.3f | offstall=%.3f | "
+                    "fail=%.3f | flips/step=%.3f | "
                     "stall_recover=%.3f | succ_steps=%.2f | solve_s=%.3f",
                     self.num_timesteps,
                     self.total_timesteps,
@@ -299,8 +316,6 @@ class TrainingLoggerCallback(BaseCallback):
                     mean_or_nan(self.final_distance_history),
                     mean_or_nan(self.failure_history),
                     mean_or_nan(self.flips_per_step_history),
-                    mean_or_nan(self.no_flip_ratio_history),
-                    mean_or_nan(self.off_stall_ratio_history),
                     mean_or_nan(self.stall_recovery_history),
                     mean_or_nan(self.steps_to_success_history),
                     mean_or_nan(self.solve_seconds_history),
@@ -313,8 +328,6 @@ class TrainingLoggerCallback(BaseCallback):
                     "mean_final_distance": mean_or_nan(self.final_distance_history),
                     "failure_rate": mean_or_nan(self.failure_history),
                     "mean_flips_per_step": mean_or_nan(self.flips_per_step_history),
-                    "mean_no_flip_ratio": mean_or_nan(self.no_flip_ratio_history),
-                    "mean_off_stall_ratio": mean_or_nan(self.off_stall_ratio_history),
                     "mean_stall_recovery_rate": mean_or_nan(self.stall_recovery_history),
                     "mean_steps_to_success": mean_or_nan(self.steps_to_success_history),
                     "mean_solve_seconds": mean_or_nan(self.solve_seconds_history),
@@ -340,20 +353,51 @@ class TrainingLoggerCallback(BaseCallback):
                 writer.writerows(self._curve_rows)
             logger.info("Learning curve written to: %s (%d rows)", curve_path, len(self._curve_rows))
 
+    def summary(self) -> dict:
+        def mean_or_nan(values: deque[float]) -> float:
+            if not values:
+                return float("nan")
+            return sum(values) / len(values)
+
+        return {
+            "episodes_in_window": len(self.success_history),
+            "success_rate": mean_or_nan(self.success_history),
+            "mean_return": mean_or_nan(self.return_history),
+            "mean_final_distance": mean_or_nan(self.final_distance_history),
+            "failure_rate": mean_or_nan(self.failure_history),
+            "mean_flips_per_step": mean_or_nan(self.flips_per_step_history),
+            "mean_stall_recovery_rate": mean_or_nan(self.stall_recovery_history),
+            "mean_steps_to_success": mean_or_nan(self.steps_to_success_history),
+            "mean_solve_seconds": mean_or_nan(self.solve_seconds_history),
+            "checkpoints_written": len(self._curve_rows),
+        }
+
 
 def main():
     args = parse_args()
     setup_logging(args.log_level, args.log_file)
     device = resolve_device(args.device)
+    k_choices = parse_k_choices(args.k_choices)
 
     instance_paths = sorted(glob.glob(args.instances))
     if not instance_paths:
         raise FileNotFoundError(f"No .npz instance files matched: {args.instances}")
 
+    run_started = time.time()
+    run_name = args.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    run_dir = Path(args.runs_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    model_save_path = Path(args.save_path) if args.save_path else (run_dir / "model")
+    curve_csv_path = Path(args.curve_csv) if args.curve_csv else (run_dir / "learning_curve.csv")
+    summary_json_path = run_dir / "run_summary.json"
+    summary_csv_path = run_dir / "run_summary.csv"
+    args_json_path = run_dir / "run_args.json"
+
     env = Monitor(
         FeasibilityPumpKEnv(
             instance_paths=instance_paths,
-            k_max=args.k_max,
+            k_choices=k_choices,
             max_iterations=args.max_iterations,
             time_limit=args.time_limit,
             stall_threshold=args.stall_threshold,
@@ -364,16 +408,16 @@ def main():
     if args.check_env:
         check_env(env.unwrapped, warn=True)
 
-    save_path = Path(args.save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    model_save_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger.info("Training on %d instances", len(instance_paths))
-    logger.info("k_max (max flips per step): %d", args.k_max)
+    logger.info("Run directory: %s", run_dir)
+    logger.info("k choices: %s", list(k_choices))
     logger.info("Time limit per episode: %.1f seconds", args.time_limit)
     logger.info("Stall threshold: %d", args.stall_threshold)
     logger.info("CPLEX threads per solve: %d", args.cplex_threads)
     logger.info("Using torch device: %s", device)
-    logger.info("Saving model to: %s", save_path)
+    logger.info("Saving model to: %s", model_save_path)
     if args.log_file:
         logger.info("Writing logs to: %s", args.log_file)
 
@@ -396,12 +440,36 @@ def main():
         total_timesteps=args.total_timesteps,
         log_every_steps=args.progress_log_steps,
         rolling_window=args.dashboard_window,
-        curve_csv=args.curve_csv,
+        curve_csv=str(curve_csv_path),
     )
+    with args_json_path.open("w", encoding="utf-8") as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True)
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
-    model.save(str(save_path))
+    model.save(str(model_save_path))
+
+    run_summary = {
+        "run_name": run_name,
+        "run_dir": str(run_dir),
+        "model_path": str(model_save_path) + ".zip",
+        "curve_csv_path": str(curve_csv_path),
+        "args_path": str(args_json_path),
+        "instances_glob": args.instances,
+        "num_instances": len(instance_paths),
+        "k_choices": list(k_choices),
+        "total_timesteps": args.total_timesteps,
+        "elapsed_seconds": time.time() - run_started,
+        "training_window_metrics": callback.summary(),
+    }
+    with summary_json_path.open("w", encoding="utf-8") as f:
+        json.dump(run_summary, f, indent=2, sort_keys=True)
+    with summary_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(run_summary.keys()))
+        writer.writeheader()
+        writer.writerow(run_summary)
 
     logger.info("Training complete")
+    logger.info("Run summary JSON: %s", summary_json_path)
+    logger.info("Run summary CSV: %s", summary_csv_path)
 
 
 if __name__ == "__main__":
