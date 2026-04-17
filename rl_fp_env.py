@@ -1287,6 +1287,8 @@ class TrainingStatsCallback(BaseCallback):
         out_dir: str = "logs",
         file_name: str = "training_stats.csv",
         flush_every: int = 10,
+        print_episode_logs: bool = True,
+        print_every_episodes: int = 1,
         verbose: int = 0,
     ) -> None:
         super().__init__(verbose)
@@ -1294,6 +1296,8 @@ class TrainingStatsCallback(BaseCallback):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path   = self.out_dir / file_name
         self.flush_every = max(1, flush_every)
+        self.print_episode_logs = bool(print_episode_logs)
+        self.print_every_episodes = max(1, int(print_every_episodes))
 
         self._ep_rewards:  List[float] = []
         self._ep_feasible: List[int]   = []
@@ -1352,6 +1356,19 @@ class TrainingStatsCallback(BaseCallback):
                 self._ep_fps.append(cur["flips"] / s)
                 self._ep_noflip.append(cur["noflip"] / s)
                 self._buf.append(self._summary_row())
+                if self.print_episode_logs and (self._episode_idx % self.print_every_episodes == 0):
+                    print(
+                        "[EP] "
+                        f"idx={self._episode_idx} "
+                        f"inst={info.get('instance_id', 'unknown')} "
+                        f"feasible={int(info.get('feasible_found', 0))} "
+                        f"failed={int(info.get('failed', 0))} "
+                        f"steps={s} "
+                        f"iters={int(info.get('nloops', info.get('iterations', 0)))} "
+                        f"dist={float(info.get('distance', 0.0)):.4f} "
+                        f"r={cur['reward']:.4f} "
+                        f"time={float(info.get('elapsed_fp_time', info.get('elapsed_seconds', 0.0))):.2f}s"
+                    )
                 if len(self._buf) >= self.flush_every:
                     self._flush()
                 self._reset_env(i)
@@ -1432,6 +1449,23 @@ if __name__ == "__main__":
                         default=DEFAULT_CPLEX_THREADS)
     parser.add_argument("--check",        action="store_true",
                         help="Run check_env before training.")
+    parser.add_argument(
+        "--print-episode-logs",
+        action="store_true",
+        default=True,
+        help="Print per-episode summaries to terminal during training.",
+    )
+    parser.add_argument(
+        "--no-print-episode-logs",
+        action="store_true",
+        help="Disable per-episode terminal logs.",
+    )
+    parser.add_argument(
+        "--print-every-episodes",
+        type=int,
+        default=1,
+        help="Print one episode summary every N completed episodes.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -1530,6 +1564,8 @@ if __name__ == "__main__":
         out_dir=args.log_dir,
         file_name=f"{file_prefix}training_stats.csv" if file_prefix else "training_stats.csv",
         flush_every=5,
+        print_episode_logs=(args.print_episode_logs and not args.no_print_episode_logs),
+        print_every_episodes=args.print_every_episodes,
         verbose=1,
     )
     model.learn(
