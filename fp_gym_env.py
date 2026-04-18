@@ -14,7 +14,7 @@ from __future__ import annotations
 # -----------------------------------------------------------------------------
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -94,7 +94,7 @@ class FPGymConfig:
     instance_paths: List[str]
 
     # Real FP backend config
-    fp_config: FPRunConfig = FPRunConfig()
+    fp_config: FPRunConfig = field(default_factory=FPRunConfig)
 
     # If reset() samples an instance that terminates in the initial LP relaxation,
     # skip it and sample another one. This helps avoid trivial episodes.
