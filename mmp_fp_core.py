@@ -617,7 +617,7 @@ class FeasibilityPumpCore:
         self.total_flips = 0
         self.last_k = 0
         self.last_flip_indices = []
-                self.last_rounding_changed = True
+        self.last_rounding_changed = True
         self.last_distance_delta = 0.0
         self.recent_distance_deltas.clear()
 
