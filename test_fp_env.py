@@ -10,10 +10,10 @@ instance_paths = [
 cfg = FPGymConfig(
     instance_paths=instance_paths,
     fp_config=FPRunConfig(
-        max_iterations=100,
-        time_limit=60.0,
-        stall_threshold=3,
-        max_stalls=50,
+        max_iterations=20,
+        time_limit=15.0,
+        stall_threshold=2,
+        max_stalls=5,
         cplex_threads=1,
     ),
     max_reset_resamples=20,
