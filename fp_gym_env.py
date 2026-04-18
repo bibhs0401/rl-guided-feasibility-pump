@@ -241,7 +241,7 @@ class FeasibilityPumpRLEnv(gym.Env):
 
             # Skip if solved immediately in the initial LP relaxation
             if runner.terminated_in_initial_relaxation:
-            print("[reset] skipping instance: solved in initial relaxation", flush=True)                
+                print("[reset] skipping instance: solved in initial relaxation", flush=True)
                 continue
 
             # Advance naturally until first stall or done
@@ -533,10 +533,10 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.best_distance = self.runner.current_distance()
 
         observation = self._build_observation()
+        print(f"[reset] sampling instance: {self.problem.instance_path}", flush=True)
         info = {
             "episode_id": self.episode_id,
             "instance_path": self.problem.instance_path,
-            print(f"[reset] sampling instance: {instance_path}", flush=True)
             "instance_name": Path(self.problem.instance_path).name,
             "m": self.problem.m,
             "n": self.problem.n,
