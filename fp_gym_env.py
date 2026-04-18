@@ -227,26 +227,42 @@ class FeasibilityPumpRLEnv(gym.Env):
 
             problem = load_npz_instance(instance_path)
             runner = FeasibilityPumpCore(problem, self.config.fp_config)
+            print("[reset] building runner and solving initial LP...", flush=True)
             runner.reset()
+            print(
+                f"[reset] after runner.reset(): "
+                f"terminated_in_initial_relaxation={runner.terminated_in_initial_relaxation}, "
+                f"done={runner.done}",
+                flush=True,
+            )
 
             last_problem = problem
             last_runner = runner
 
             # Skip if solved immediately in the initial LP relaxation
             if runner.terminated_in_initial_relaxation:
+            print("[reset] skipping instance: solved in initial relaxation", flush=True)                
                 continue
 
             # Advance naturally until first stall or done
             if not runner.done:
+                print("[reset] advancing until first stall or done...", flush=True)
                 runner.advance_until_stall_or_done()
+                print(
+                    f"[reset] after natural advance: done={runner.done}, stalled={runner.is_stalled()}, "
+                    f"iterations={runner.iteration}, current_distance={runner.current_distance()}",
+                    flush=True,
+                )
 
             # Accept only if the runner is now at a real decision point
             # (not done, and stalled)
             if (not runner.done) and runner.is_stalled():
+                print("[reset] accepted instance: reached real decision point", flush=True)
                 return problem, runner
-
+            print("[reset] rejected instance: no usable decision point reached", flush=True)
         # Fallback: return the last sampled runner even if it was not ideal.
         # This avoids infinite reset loops when the pool is mostly easy.
+        print("[reset] fallback: returning last sampled runner", flush=True)
         return last_problem, last_runner
 
     # -------------------------------------------------------------------------
@@ -520,6 +536,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         info = {
             "episode_id": self.episode_id,
             "instance_path": self.problem.instance_path,
+            print(f"[reset] sampling instance: {instance_path}", flush=True)
             "instance_name": Path(self.problem.instance_path).name,
             "m": self.problem.m,
             "n": self.problem.n,
