@@ -212,12 +212,12 @@ class FeasibilityPumpRLEnv(gym.Env):
         """
         Load an instance and initialize the FP runner.
 
-        If the instance terminates in the initial LP relaxation, resample another
-        one until:
-        - we get a nontrivial instance, or
-        - max_reset_resamples is reached.
+        We skip instances that are not useful for RL, including:
+        1. instances that terminate in the initial LP relaxation
+        2. instances that get solved before the first decision point
 
-        If all attempts are trivial, we return the last sampled runner anyway.
+        A valid training episode should leave the runner at a real decision point
+        where the agent can take an action.
         """
         last_problem = None
         last_runner = None
@@ -232,13 +232,21 @@ class FeasibilityPumpRLEnv(gym.Env):
             last_problem = problem
             last_runner = runner
 
-            # We want nontrivial RL episodes:
-            # skip instances that end immediately in the initial LP relaxation.
-            if not runner.terminated_in_initial_relaxation:
+            # Skip if solved immediately in the initial LP relaxation
+            if runner.terminated_in_initial_relaxation:
+                continue
+
+            # Advance naturally until first stall or done
+            if not runner.done:
+                runner.advance_until_stall_or_done()
+
+            # Accept only if the runner is now at a real decision point
+            # (not done, and stalled)
+            if (not runner.done) and runner.is_stalled():
                 return problem, runner
 
-        # If everything sampled was trivial, return the last one anyway.
-        # This avoids reset() crashing.
+        # Fallback: return the last sampled runner even if it was not ideal.
+        # This avoids infinite reset loops when the pool is mostly easy.
         return last_problem, last_runner
 
     # -------------------------------------------------------------------------
@@ -504,14 +512,9 @@ class FeasibilityPumpRLEnv(gym.Env):
 
         self.problem, self.runner = self._load_nontrivial_instance(requested_path=requested_path)
 
-        # Initialize best distance from the current runner state
+        # _load_nontrivial_instance() already advances to the first usable
+        # decision point when possible.
         self.best_distance = self.runner.current_distance()
-
-        # Move naturally until the first stall / decision point, unless already done
-        if not self.runner.done:
-            self.runner.advance_until_stall_or_done()
-
-        self.best_distance = min(self.best_distance, self.runner.current_distance())
 
         observation = self._build_observation()
         info = {
