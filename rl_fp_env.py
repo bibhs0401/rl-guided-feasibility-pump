@@ -1414,6 +1414,8 @@ if __name__ == "__main__":
     from stable_baselines3 import PPO
     from stable_baselines3.common.env_checker import check_env
     from stable_baselines3.common.monitor import Monitor
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
+    import torch
 
     # ── CLI ───────────────────────────────────────────────────────────────
     parser = argparse.ArgumentParser(
@@ -1447,6 +1449,26 @@ if __name__ == "__main__":
                         default=DEFAULT_TIME_LIMIT)
     parser.add_argument("--cplex-threads", type=int,
                         default=DEFAULT_CPLEX_THREADS)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=1,
+        help="Number of parallel environments. Uses SubprocVecEnv when > 1.",
+    )
+    parser.add_argument(
+        "--vec-start-method",
+        type=str,
+        default="auto",
+        choices=["auto", "fork", "spawn", "forkserver"],
+        help="Process start method for SubprocVecEnv. 'auto' => fork on POSIX, spawn on Windows.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Torch device for PPO. 'auto' picks CUDA when available.",
+    )
     parser.add_argument("--check",        action="store_true",
                         help="Run check_env before training.")
     parser.add_argument(
@@ -1467,6 +1489,8 @@ if __name__ == "__main__":
         help="Print one episode summary every N completed episodes.",
     )
     args = parser.parse_args()
+    if args.num_envs < 1:
+        raise ValueError("--num-envs must be >= 1")
 
     os.makedirs(args.log_dir, exist_ok=True)
 
@@ -1479,6 +1503,13 @@ if __name__ == "__main__":
     if file_prefix and not file_prefix.endswith("_"):
         file_prefix = f"{file_prefix}_"
 
+    vec_start_method = (
+        args.vec_start_method
+        if args.vec_start_method != "auto"
+        else ("fork" if os.name == "posix" else "spawn")
+    )
+    device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else args.device
+
     # ── Resolve instance paths ────────────────────────────────────────────
     instance_paths: List[str] = sorted(_glob.glob(args.instances)) \
         if args.instances else []
@@ -1487,6 +1518,10 @@ if __name__ == "__main__":
         print(f"[INFO] Real backend — {len(instance_paths)} instance(s) found.")
     else:
         print("[INFO] No instances supplied or fp_ppo unavailable — using MockFPBackend.")
+    print(f"[INFO] Parallel envs: {args.num_envs}")
+    print(f"[INFO] PPO device: {device}")
+    if args.num_envs > 1:
+        print(f"[INFO] Vec start method: {vec_start_method}")
 
     # ── Config ────────────────────────────────────────────────────────────
     cfg = FPConfig(
@@ -1514,6 +1549,9 @@ if __name__ == "__main__":
     run_config = {
         "env_config": cfg.to_json(),
         "ppo_hparams": ppo_hparams,
+        "num_envs": args.num_envs,
+        "vec_start_method": vec_start_method if args.num_envs > 1 else "none",
+        "device": device,
         "flip_bins": [
             "1", "max(2,ceil(0.01*n))", "ceil(0.02*n)",
             "ceil(0.05*n)", "ceil(0.10*n)", "ceil(0.20*n)",
@@ -1536,15 +1574,42 @@ if __name__ == "__main__":
     with open(os.path.join(args.log_dir, f"{file_prefix}run_config.json"), "w") as f:
         json.dump(run_config, f, indent=2, default=str)
 
-    # ── Build env ─────────────────────────────────────────────────────────
-    raw_env = FeasibilityPumpEnv(config=cfg, logger=fp_logger)
+    # ── Build env (single or vectorized) ──────────────────────────────────
+    if args.num_envs == 1:
+        raw_env = FeasibilityPumpEnv(config=cfg, logger=fp_logger)
+        if args.check:
+            print("[INFO] Running check_env …")
+            check_env(raw_env, warn=True)
+            print("[INFO] check_env: OK")
+        env = Monitor(raw_env)
+    else:
+        if args.check:
+            print("[INFO] Running check_env on a single probe env …")
+            probe_env = FeasibilityPumpEnv(config=cfg, logger=None)
+            check_env(probe_env, warn=True)
+            probe_env.close()
+            print("[INFO] check_env: OK")
 
-    if args.check:
-        print("[INFO] Running check_env …")
-        check_env(raw_env, warn=True)
-        print("[INFO] check_env: OK")
+        # In subprocess mode, avoid sharing one file logger across processes.
+        # Keep aggregated training stats via TrainingStatsCallback.
+        print("[INFO] Multi-env mode: per-step FPLogger files are disabled to avoid write races.")
 
-    env = Monitor(raw_env)
+        def make_env(rank: int):
+            def _init():
+                cfg_i = FPConfig(**cfg.to_json())
+                if cfg.seed is not None:
+                    cfg_i.seed = int(cfg.seed) + rank
+                return FeasibilityPumpEnv(config=cfg_i, logger=None)
+            return _init
+
+        if os.name == "posix":
+            env = SubprocVecEnv(
+                [make_env(i) for i in range(args.num_envs)],
+                start_method=vec_start_method,
+            )
+        else:
+            env = DummyVecEnv([make_env(i) for i in range(args.num_envs)])
+        env = VecMonitor(env)
 
     # ── PPO with MultiInputPolicy (required for Dict obs) ─────────────────
     model = PPO(
@@ -1558,6 +1623,7 @@ if __name__ == "__main__":
         gae_lambda=ppo_hparams["gae_lambda"],
         ent_coef=ppo_hparams["ent_coef"],
         seed=ppo_hparams["seed"],
+        device=device,
     )
 
     stats_cb = TrainingStatsCallback(
@@ -1574,7 +1640,8 @@ if __name__ == "__main__":
     )
 
     # ── Flush logs ────────────────────────────────────────────────────────
-    raw_env.save_logs()
+    if args.num_envs == 1:
+        raw_env.save_logs()
     env.close()
 
     # ── Short rollout diagnostic ──────────────────────────────────────────

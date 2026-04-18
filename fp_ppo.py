@@ -18,9 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Discrete perturbation sizes chosen by the policy at stall events.
 DEFAULT_K_CHOICES = (1, 2, 5, 10, 20, 50)
-DYNAMIC_FEATURE_DIM = 10
+# DYNAMIC_FEATURE_DIM = 10
 # Kept for backward compatibility with legacy feature builders.
-INSTANCE_FEATURE_DIM = 16
+# INSTANCE_FEATURE_DIM = 16
 DEFAULT_TIME_LIMIT = 30.0
 DEFAULT_STALL_THRESHOLD = 3
 DEFAULT_MAX_STALLS = 50
