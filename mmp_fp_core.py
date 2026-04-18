@@ -555,8 +555,11 @@ class FeasibilityPumpCore:
         self.last_distance_delta = 0.0
         self.recent_distance_deltas: deque[float] = deque(maxlen=config.recent_delta_window)
 
-        # Initial LP objective (useful later as a feature or diagnostic)
+        # Initial LP diagnostics
         self.initial_lp_objective = 0.0
+        self.initial_solution_was_integer = False
+        self.terminated_in_initial_relaxation = False
+        self.initial_distance = 0.0
 
         # Current FP state
         self.x_relaxed: Optional[list[float]] = None
@@ -614,9 +617,14 @@ class FeasibilityPumpCore:
         self.total_flips = 0
         self.last_k = 0
         self.last_flip_indices = []
-        self.last_rounding_changed = True
+                self.last_rounding_changed = True
         self.last_distance_delta = 0.0
         self.recent_distance_deltas.clear()
+
+        self.initial_solution_was_integer = False
+        self.terminated_in_initial_relaxation = False
+        self.initial_distance = 0.0
+
         self.x_relaxed = None
         self.x_rounded = None
         self.y_values = None
@@ -638,13 +646,27 @@ class FeasibilityPumpCore:
 
         self.x_relaxed, self.y_values, self.initial_lp_objective = result
 
-        # Build first rounded point
+        # Build the first rounded point from the initial LP solution
         self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
 
-        # If the relaxed LP solution is already integer, FP is done immediately
-        if is_integer_solution(self.x_relaxed, self.problem.integer_indices):
+        # Record the initial FP distance before any FP iteration happens
+        self.initial_distance = fp_distance(
+            self.x_relaxed,
+            self.x_rounded,
+            self.problem.integer_indices,
+        )
+
+        # Check whether the initial LP solution is already integer-feasible
+        self.initial_solution_was_integer = is_integer_solution(
+            self.x_relaxed,
+            self.problem.integer_indices,
+        )
+
+        # If yes, the run terminates before the FP loop starts
+        if self.initial_solution_was_integer:
             self.integer_found = True
             self.done = True
+            self.terminated_in_initial_relaxation = True
 
     def is_stalled(self) -> bool:
         """
@@ -846,6 +868,12 @@ def run_single_fp_episode(instance_path: str | Path, config: Optional[FPRunConfi
         "total_flips": runner.total_flips,
         "integer_found": runner.integer_found,
         "failed": runner.failed,
+
+        # New diagnostics
+        "terminated_in_initial_relaxation": runner.terminated_in_initial_relaxation,
+        "initial_solution_was_integer": runner.initial_solution_was_integer,
+        "initial_distance": runner.initial_distance,
+
         "final_distance": runner.current_distance(),
         "initial_lp_objective": runner.initial_lp_objective,
         "elapsed_seconds": 0.0 if runner.start_time is None else (time.time() - runner.start_time),
