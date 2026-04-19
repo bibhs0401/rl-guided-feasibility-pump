@@ -629,16 +629,28 @@ class FeasibilityPumpCore:
         self.x_rounded = None
         self.y_values = None
 
-        # Start FP wall-clock timer after model construction
-        self.start_time = time.time()
+        # -----------------------------------------------------------------
+        # Important baseline-matching behavior:
+        #
+        # In main_phase1.py, the initial LP relaxation is solved BEFORE the
+        # feasibility-pump loop timer starts. The FP time limit applies to
+        # the iterative pumping loop, not to the initial LP solve itself.
+        #
+        # So here we solve the initial LP without consuming the FP loop time
+        # budget. The timer will start only after the initial LP solution and
+        # initial rounded point have been created.
+        # -----------------------------------------------------------------
 
-        # Solve the initial LP relaxation
+        self.start_time = None
+
+        # Solve the initial LP relaxation WITHOUT using the FP episode budget
         result = solve_relaxation_model(
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=self.remaining_time(),
+            max_seconds=None,
         )
+        
         if result is None:
             self.failed = True
             self.done = True
@@ -667,6 +679,17 @@ class FeasibilityPumpCore:
             self.integer_found = True
             self.done = True
             self.terminated_in_initial_relaxation = True
+            return
+
+        # -----------------------------------------------------------------
+        # Baseline-matching timing:
+        #
+        # Only now do we start the FP-loop timer.
+        # This matches main_phase1.py, where the feasibility-pump loop gets
+        # its own timer after the initial LP relaxation has already been
+        # solved and rounded.
+        # -----------------------------------------------------------------
+        self.start_time = time.time()
 
     def is_stalled(self) -> bool:
         """
