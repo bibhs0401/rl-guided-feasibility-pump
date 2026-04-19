@@ -208,60 +208,84 @@ class FeasibilityPumpRLEnv(gym.Env):
         idx = int(self.rng.integers(0, len(self.config.instance_paths)))
         return self.config.instance_paths[idx]
 
-    def _load_nontrivial_instance(self, requested_path: Optional[str] = None) -> Tuple[ProblemInstance, FeasibilityPumpCore]:
+    def _load_nontrivial_instance(
+        self,
+        requested_path: Optional[str] = None
+    ) -> Tuple[ProblemInstance, FeasibilityPumpCore]:
         """
         Load an instance and initialize the FP runner.
 
-        We skip instances that are not useful for RL, including:
-        1. instances that terminate in the initial LP relaxation
-        2. instances that get solved before the first decision point
-
-        A valid training episode should leave the runner at a real decision point
-        where the agent can take an action.
+        Reset policy after Fix 1 / Fix 2:
+        - skip instances solved immediately in the initial LP relaxation
+        - skip instances that fail during reset
+        - advance natural FP until the first decision point
+        - accept as soon as the runner is at a usable RL state
+        - if no such state is found after several attempts, return the last
+          sampled runner instead of looping forever
         """
         last_problem = None
         last_runner = None
 
         for attempt in range(self.config.max_reset_resamples):
-            instance_path = requested_path if (attempt == 0 and requested_path is not None) else self._sample_instance_path()
+            instance_path = (
+                requested_path
+                if (attempt == 0 and requested_path is not None)
+                else self._sample_instance_path()
+            )
+
+            print(f"[reset] attempt={attempt + 1} instance={instance_path}", flush=True)
 
             problem = load_npz_instance(instance_path)
             runner = FeasibilityPumpCore(problem, self.config.fp_config)
-            print("[reset] building runner and solving initial LP...", flush=True)
             runner.reset()
+
             print(
                 f"[reset] after runner.reset(): "
+                f"failed={runner.failed}, "
+                f"done={runner.done}, "
                 f"terminated_in_initial_relaxation={runner.terminated_in_initial_relaxation}, "
-                f"done={runner.done}",
+                f"initial_lp_solve_s={getattr(runner, 'initial_lp_solve_seconds', 0.0):.2f}, "
+                f"reset_s={getattr(runner, 'reset_seconds', 0.0):.2f}",
                 flush=True,
             )
 
             last_problem = problem
             last_runner = runner
 
-            # Skip if solved immediately in the initial LP relaxation
+            # Skip instances that fail before FP can even start
+            if runner.failed:
+                print("[reset] skipping instance: reset failed", flush=True)
+                continue
+
+            # Skip instances solved immediately in the initial LP relaxation
             if runner.terminated_in_initial_relaxation:
                 print("[reset] skipping instance: solved in initial relaxation", flush=True)
                 continue
 
-            # Advance naturally until first stall or done
+            # Advance naturally until first decision point or termination
             if not runner.done:
-                print("[reset] advancing until first stall or done...", flush=True)
+                print("[reset] advancing until first decision point or done...", flush=True)
                 runner.advance_until_stall_or_done()
                 print(
-                    f"[reset] after natural advance: done={runner.done}, stalled={runner.is_stalled()}, "
-                    f"iterations={runner.iteration}, current_distance={runner.current_distance()}",
+                    f"[reset] after natural advance: "
+                    f"done={runner.done}, "
+                    f"failed={runner.failed}, "
+                    f"stalled={runner.is_stalled()}, "
+                    f"iterations={runner.iteration}, "
+                    f"distance={runner.current_distance():.4f}",
                     flush=True,
                 )
 
-            # Accept only if the runner is now at a real decision point
-            # (not done, and stalled)
-            if (not runner.done) and runner.is_stalled():
-                print("[reset] accepted instance: reached real decision point", flush=True)
+            # Accept only when the agent can really act next
+            if (not runner.done) and (not runner.failed) and runner.is_stalled():
+                print("[reset] accepted instance: decision point reached", flush=True)
                 return problem, runner
-            print("[reset] rejected instance: no usable decision point reached", flush=True)
-        # Fallback: return the last sampled runner even if it was not ideal.
-        # This avoids infinite reset loops when the pool is mostly easy.
+
+            print("[reset] rejected instance: no usable RL decision point", flush=True)
+
+        # Fallback: return the last sampled runner even if not ideal.
+        # This prevents infinite reset loops when the pool is mostly trivial
+        # or mostly early-failing.
         print("[reset] fallback: returning last sampled runner", flush=True)
         return last_problem, last_runner
 
@@ -534,17 +558,29 @@ class FeasibilityPumpRLEnv(gym.Env):
 
         observation = self._build_observation()
         print(f"[reset] sampling instance: {self.problem.instance_path}", flush=True)
-        info = {
+                info = {
             "episode_id": self.episode_id,
-            "instance_path": self.problem.instance_path,
-            "instance_name": Path(self.problem.instance_path).name,
-            "m": self.problem.m,
-            "n": self.problem.n,
-            "p": self.problem.p,
-            "terminated_in_initial_relaxation": self.runner.terminated_in_initial_relaxation,
-            "initial_solution_was_integer": self.runner.initial_solution_was_integer,
-            "initial_distance": self.runner.initial_distance,
-            "current_distance": self.runner.current_distance(),
+            "instance_path": self.problem.instance_path if self.problem is not None else None,
+            "instance_name": Path(self.problem.instance_path).name if self.problem is not None else None,
+            "m": self.problem.m if self.problem is not None else None,
+            "n": self.problem.n if self.problem is not None else None,
+            "p": self.problem.p if self.problem is not None else None,
+
+            "failed": self.runner.failed if self.runner is not None else None,
+            "integer_found": self.runner.integer_found if self.runner is not None else None,
+            "terminated_in_initial_relaxation": self.runner.terminated_in_initial_relaxation if self.runner is not None else None,
+            "initial_solution_was_integer": self.runner.initial_solution_was_integer if self.runner is not None else None,
+
+            "initial_distance": self.runner.initial_distance if self.runner is not None else None,
+            "current_distance": self.runner.current_distance() if self.runner is not None else None,
+
+            "iterations": self.runner.iteration if self.runner is not None else None,
+            "stall_events": self.runner.stall_events if self.runner is not None else None,
+
+            "relaxation_build_seconds": getattr(self.runner, "relaxation_build_seconds", 0.0) if self.runner is not None else None,
+            "distance_build_seconds": getattr(self.runner, "distance_build_seconds", 0.0) if self.runner is not None else None,
+            "initial_lp_solve_seconds": getattr(self.runner, "initial_lp_solve_seconds", 0.0) if self.runner is not None else None,
+            "reset_seconds": getattr(self.runner, "reset_seconds", 0.0) if self.runner is not None else None,
         }
         return observation, info
 
