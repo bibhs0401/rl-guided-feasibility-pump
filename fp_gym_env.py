@@ -558,7 +558,7 @@ class FeasibilityPumpRLEnv(gym.Env):
 
         observation = self._build_observation()
         print(f"[reset] sampling instance: {self.problem.instance_path}", flush=True)
-                info = {
+        info = {
             "episode_id": self.episode_id,
             "instance_path": self.problem.instance_path if self.problem is not None else None,
             "instance_name": Path(self.problem.instance_path).name if self.problem is not None else None,
