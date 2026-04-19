@@ -719,15 +719,29 @@ class FeasibilityPumpCore:
 
     def is_stalled(self) -> bool:
         """
-        A simple stall rule:
-        FP is stalled when the number of consecutive no-change iterations
-        reaches the configured threshold.
+        Baseline-matching interpretation of a decision point.
+
+        In main_phase1.py, the algorithm flips immediately when rounding no
+        longer changes. It does not wait for several no-change rounds.
+
+        So here, one no-change event is enough to say that FP has reached the
+        point where a flip decision is needed.
         """
-        return self.consecutive_no_change >= self.config.stall_threshold
+        return self.consecutive_no_change >= 1
 
     def run_one_iteration(self, flip_indices: Sequence[int]) -> bool:
         """
         Run exactly one FP distance-projection iteration.
+
+        Baseline-matching intent
+        ------------------------
+        This is closer to main_phase1.py:
+
+        - solve one distance-projection step
+        - if the new relaxed point is integer, stop
+        - if rounding the new relaxed point changes the current rounded point,
+          update the rounded point and continue naturally
+        - otherwise, mark an immediate decision/stall point
 
         Parameters
         ----------
@@ -749,11 +763,14 @@ class FeasibilityPumpCore:
             self.done = True
             return False
 
-        # Stop if time budget is exhausted
+        # Stop if FP-loop time budget is exhausted
         remaining = self.remaining_time()
         if remaining is not None and remaining <= 0:
             self.done = True
             return False
+
+        num_flips = len(flip_indices)
+        prev_stalled = self.is_stalled()
 
         # Apply perturbation to the rounded point if requested
         if flip_indices:
@@ -761,12 +778,12 @@ class FeasibilityPumpCore:
 
         prev_distance = self.current_distance()
 
-        # Record the perturbation metadata
+        # Record perturbation metadata
         self.last_flip_indices = list(flip_indices)
-        self.last_k = len(flip_indices)
-        self.total_flips += len(flip_indices)
+        self.last_k = num_flips
+        self.total_flips += num_flips
 
-        # Solve the distance-projection model against the current rounded point
+        # Solve one distance-projection step against the current rounded point
         result = solve_distance_model(
             self.distance_model,
             self.distance_z,
@@ -778,7 +795,7 @@ class FeasibilityPumpCore:
         )
         self.iteration += 1
 
-        # If the solve fails, we terminate the run
+        # If the solve fails, terminate the run
         if result is None:
             self.failed = True
             self.done = True
@@ -792,37 +809,45 @@ class FeasibilityPumpCore:
         self.last_distance_delta = prev_distance - new_distance
         self.recent_distance_deltas.append(self.last_distance_delta)
 
-        # If the projection landed on an integer point, FP succeeded
+        # If projection landed on an integer point, FP succeeded
         if is_integer_solution(self.x_relaxed, self.problem.integer_indices):
             self.integer_found = True
             self.done = True
             return True
 
-        # Check whether re-rounding would change the rounded point
+        # -------------------------------------------------------------
+        # Core baseline-matching logic:
+        # if rounding changes, update the rounded guide point;
+        # otherwise, this is immediately a flip / decision point.
+        # -------------------------------------------------------------
         self.last_rounding_changed = rounding_changed(
             self.x_relaxed,
             self.x_rounded,
             self.problem.integer_indices,
         )
 
-        # If rounding changed, update the rounded point and reset stall count
         if self.last_rounding_changed:
-            self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
+            self.x_rounded = round_integer_values(
+                self.x_relaxed,
+                self.problem.integer_indices,
+            )
             self.consecutive_no_change = 0
 
-        # If we explicitly perturbed, also reset the no-change streak
-        elif len(flip_indices) > 0:
+        elif num_flips > 0:
+            # A manual flip was just applied. Reset the no-change streak after
+            # that perturbation step.
             self.consecutive_no_change = 0
 
-        # Otherwise, this was a natural no-change step, so increase the streak
         else:
-            self.consecutive_no_change += 1
+            # One no-change event is already the decision point.
+            self.consecutive_no_change = 1
 
-        # Count a stall event whenever the threshold is reached
-        if self.is_stalled():
+        # Count a stall event only when entering stalled state
+        currently_stalled = self.is_stalled()
+        if currently_stalled and not prev_stalled:
             self.stall_events += 1
 
-        # Apply global stopping conditions
+        # Global stopping conditions
         remaining = self.remaining_time()
         if self.iteration >= self.config.max_iterations:
             self.done = True
@@ -835,16 +860,27 @@ class FeasibilityPumpCore:
 
     def advance_until_stall_or_done(self) -> None:
         """
-        Run FP naturally with NO perturbation until:
-        - a stall is reached, or
-        - the run ends.
+        Run natural FP steps (no manual flip) until:
+        - FP is done, or
+        - a no-change event occurs and a flip decision is needed.
 
-        This is important because later in RL we want:
-        one RL decision = one stall intervention window.
+        Baseline-matching intent
+        ------------------------
+        In main_phase1.py, once the distance-projection step produces a relaxed
+        point whose rounding does not change the current rounded guide point,
+        the algorithm flips immediately. It does not wait for several repeated
+        no-change rounds.
+
+        So here we stop natural advancement as soon as the first no-change event
+        is detected, which becomes the decision point for the caller.
         """
-        while not self.done and not self.is_stalled():
+        while not self.done:
             executed = self.run_one_iteration([])
             if not executed:
+                break
+
+            # As soon as one no-change event occurs, return control.
+            if self.is_stalled():
                 break
 
     def apply_flip_count(self, flip_count: int) -> None:
