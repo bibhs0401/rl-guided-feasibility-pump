@@ -90,11 +90,21 @@ class FPRunConfig:
     """
     Configuration for one real Feasibility Pump run.
 
-    These are backend settings only. RL-specific settings will come later
-    when we build the Gymnasium environment.
+    Notes
+    -----
+    time_limit:
+        FP-loop time budget after the initial LP relaxation has already been
+        solved. This is the quantity that should match the baseline semantics
+        in main_phase1.py.
+
+    initial_lp_time_limit:
+        Separate protective cap for the initial LP relaxation solve.
+        This is an engineering safeguard so reset() does not hang for a very
+        long time on difficult instances.
     """
     max_iterations: int = 100
     time_limit: float = 30.0
+    initial_lp_time_limit: float | None = 180.0
     stall_threshold: int = 3
     max_stalls: int = 50
     recent_delta_window: int = 5
@@ -596,29 +606,18 @@ class FeasibilityPumpCore:
         """
         Initialize one FP run.
 
-        Steps:
-        1. Build the relaxation model
-        2. Build the distance model
-        3. Solve the initial LP relaxation
-        4. Create the initial rounded point
-        5. Check if the initial LP solution is already integer-feasible
+        Baseline-matching behavior
+        --------------------------
+        In main_phase1.py, the initial LP relaxation is solved BEFORE the
+        feasibility-pump loop timer starts. The FP time limit applies to the
+        iterative FP loop, not to the initial LP solve itself.
+
+        Practical safeguard
+        -------------------
+        We add a separate optional initial_lp_time_limit so reset() does not
+        hang for a very long time on difficult instances.
         """
-        
         reset_started = time.time()
-
-        build_started = time.time()
-        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
-            self.problem,
-            cplex_threads=self.config.cplex_threads,
-        )
-        self.relaxation_build_seconds = time.time() - build_started
-
-        build_started = time.time()
-        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
-            self.problem,
-            cplex_threads=self.config.cplex_threads,
-        )
-        self.distance_build_seconds = time.time() - build_started
 
         # Reset all episode counters / state
         self.iteration = 0
@@ -647,30 +646,38 @@ class FeasibilityPumpCore:
         self.x_rounded = None
         self.y_values = None
 
-        # -----------------------------------------------------------------
-        # Important baseline-matching behavior:
-        #
-        # In main_phase1.py, the initial LP relaxation is solved BEFORE the
-        # feasibility-pump loop timer starts. The FP time limit applies to
-        # the iterative pumping loop, not to the initial LP solve itself.
-        #
-        # So here we solve the initial LP without consuming the FP loop time
-        # budget. The timer will start only after the initial LP solution and
-        # initial rounded point have been created.
-        # -----------------------------------------------------------------
+        # -------------------------------------------------------------
+        # Build reusable docplex models
+        # -------------------------------------------------------------
+        build_started = time.time()
+        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
+            self.problem,
+            cplex_threads=self.config.cplex_threads,
+        )
+        self.relaxation_build_seconds = time.time() - build_started
 
+        build_started = time.time()
+        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
+            self.problem,
+            cplex_threads=self.config.cplex_threads,
+        )
+        self.distance_build_seconds = time.time() - build_started
+
+        # -------------------------------------------------------------
+        # Important baseline-matching behavior:
+        # solve the initial LP BEFORE starting the FP-loop timer.
+        # -------------------------------------------------------------
         self.start_time = None
 
-        # Solve the initial LP relaxation WITHOUT using the FP episode budget
         solve_started = time.time()
         result = solve_relaxation_model(
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=None,
+            max_seconds=self.config.initial_lp_time_limit,
         )
         self.initial_lp_solve_seconds = time.time() - solve_started
-        
+
         if result is None:
             self.failed = True
             self.done = True
@@ -703,14 +710,10 @@ class FeasibilityPumpCore:
             self.reset_seconds = time.time() - reset_started
             return
 
-        # -----------------------------------------------------------------
-        # Baseline-matching timing:
-        #
+        # -------------------------------------------------------------
         # Only now do we start the FP-loop timer.
-        # This matches main_phase1.py, where the feasibility-pump loop gets
-        # its own timer after the initial LP relaxation has already been
-        # solved and rounded.
-        # -----------------------------------------------------------------
+        # This matches main_phase1.py semantics more closely.
+        # -------------------------------------------------------------
         self.start_time = time.time()
         self.reset_seconds = time.time() - reset_started
 
@@ -948,6 +951,12 @@ if __name__ == "__main__":
     parser.add_argument("--stall-threshold", type=int, default=3)
     parser.add_argument("--max-stalls", type=int, default=50)
     parser.add_argument("--cplex-threads", type=int, default=1)
+    parser.add_argument(
+        "--initial-lp-time-limit",
+        type=float,
+        default=30.0,
+        help="Separate time limit in seconds for the initial LP relaxation solve.",
+    )
     args = parser.parse_args()
 
     # Simple console logging setup
@@ -963,6 +972,7 @@ if __name__ == "__main__":
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,
+        initial_lp_time_limit=args.initial_lp_time_limit,
     )
 
     # Run one real FP episode and print the summary
