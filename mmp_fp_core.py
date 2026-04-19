@@ -561,6 +561,12 @@ class FeasibilityPumpCore:
         self.terminated_in_initial_relaxation = False
         self.initial_distance = 0.0
 
+        # Timing diagnostics
+        self.relaxation_build_seconds = 0.0
+        self.distance_build_seconds = 0.0
+        self.initial_lp_solve_seconds = 0.0
+        self.reset_seconds = 0.0
+
         # Current FP state
         self.x_relaxed: Optional[list[float]] = None
         self.x_rounded: Optional[list[float]] = None
@@ -597,15 +603,22 @@ class FeasibilityPumpCore:
         4. Create the initial rounded point
         5. Check if the initial LP solution is already integer-feasible
         """
-        # Build reusable docplex models
+        
+        reset_started = time.time()
+
+        build_started = time.time()
         self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
             self.problem,
             cplex_threads=self.config.cplex_threads,
         )
+        self.relaxation_build_seconds = time.time() - build_started
+
+        build_started = time.time()
         self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
             self.problem,
             cplex_threads=self.config.cplex_threads,
         )
+        self.distance_build_seconds = time.time() - build_started
 
         # Reset all episode counters / state
         self.iteration = 0
@@ -624,6 +637,11 @@ class FeasibilityPumpCore:
         self.initial_solution_was_integer = False
         self.terminated_in_initial_relaxation = False
         self.initial_distance = 0.0
+
+        self.relaxation_build_seconds = 0.0
+        self.distance_build_seconds = 0.0
+        self.initial_lp_solve_seconds = 0.0
+        self.reset_seconds = 0.0
 
         self.x_relaxed = None
         self.x_rounded = None
@@ -644,16 +662,19 @@ class FeasibilityPumpCore:
         self.start_time = None
 
         # Solve the initial LP relaxation WITHOUT using the FP episode budget
+        solve_started = time.time()
         result = solve_relaxation_model(
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
             max_seconds=None,
         )
+        self.initial_lp_solve_seconds = time.time() - solve_started
         
         if result is None:
             self.failed = True
             self.done = True
+            self.reset_seconds = time.time() - reset_started
             return
 
         self.x_relaxed, self.y_values, self.initial_lp_objective = result
@@ -679,6 +700,7 @@ class FeasibilityPumpCore:
             self.integer_found = True
             self.done = True
             self.terminated_in_initial_relaxation = True
+            self.reset_seconds = time.time() - reset_started
             return
 
         # -----------------------------------------------------------------
@@ -690,6 +712,7 @@ class FeasibilityPumpCore:
         # solved and rounded.
         # -----------------------------------------------------------------
         self.start_time = time.time()
+        self.reset_seconds = time.time() - reset_started
 
     def is_stalled(self) -> bool:
         """
@@ -892,13 +915,19 @@ def run_single_fp_episode(instance_path: str | Path, config: Optional[FPRunConfi
         "integer_found": runner.integer_found,
         "failed": runner.failed,
 
-        # New diagnostics
+        # Initial diagnostics
         "terminated_in_initial_relaxation": runner.terminated_in_initial_relaxation,
         "initial_solution_was_integer": runner.initial_solution_was_integer,
         "initial_distance": runner.initial_distance,
+        "initial_lp_objective": runner.initial_lp_objective,
+
+        # Timing diagnostics
+        "relaxation_build_seconds": runner.relaxation_build_seconds,
+        "distance_build_seconds": runner.distance_build_seconds,
+        "initial_lp_solve_seconds": runner.initial_lp_solve_seconds,
+        "reset_seconds": runner.reset_seconds,
 
         "final_distance": runner.current_distance(),
-        "initial_lp_objective": runner.initial_lp_objective,
         "elapsed_seconds": 0.0 if runner.start_time is None else (time.time() - runner.start_time),
     }
 
