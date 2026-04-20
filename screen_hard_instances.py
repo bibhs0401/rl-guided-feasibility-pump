@@ -4,6 +4,9 @@ import argparse
 import csv
 import glob
 import json
+import logging
+import sys
+import time
 from pathlib import Path
 from typing import List
 
@@ -120,8 +123,28 @@ def main():
     parser.add_argument("--stall-threshold", type=int, default=3)
     parser.add_argument("--max-stalls", type=int, default=50)
     parser.add_argument("--cplex-threads", type=int, default=1)
+    parser.add_argument(
+        "--initial-lp-time-limit",
+        type=float,
+        default=200.0,
+        help="Time limit in seconds for initial LP solve per instance.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Console log level for backend modules.",
+    )
     parser.add_argument("--seed-tag", default="seed10", help="Tag to include in output filenames.")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s  %(name)s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+    logging.getLogger("mmp_fp_core").setLevel(getattr(logging, args.log_level))
 
     instance_paths: List[str] = sorted(glob.glob(args.instances))
     if not instance_paths:
@@ -133,6 +156,7 @@ def main():
     fp_cfg = FPRunConfig(
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
+        initial_lp_time_limit=args.initial_lp_time_limit,
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,
@@ -145,7 +169,7 @@ def main():
 
     for idx, instance_path in enumerate(instance_paths, start=1):
         print(f"[screen] ({idx}/{len(instance_paths)}) {instance_path}", flush=True)
-
+        t0 = time.time()
         summary = run_single_fp_episode(instance_path, fp_cfg)
         summary["instance_name"] = Path(instance_path).name
         summary["class_label"] = classify_instance(summary)
@@ -162,7 +186,8 @@ def main():
             f"iters={summary['iterations']} "
             f"stalls={summary['stall_events']} "
             f"time={summary['elapsed_seconds']:.2f}s "
-            f"class={summary['class_label']}",
+            f"class={summary['class_label']} "
+            f"wall={time.time() - t0:.2f}s",
             flush=True,
         )
 
@@ -231,10 +256,12 @@ def main():
         "screening_config": {
             "instances_glob": args.instances,
             "time_limit": args.time_limit,
+            "initial_lp_time_limit": args.initial_lp_time_limit,
             "max_iterations": args.max_iterations,
             "stall_threshold": args.stall_threshold,
             "max_stalls": args.max_stalls,
             "cplex_threads": args.cplex_threads,
+            "log_level": args.log_level,
         },
     }
 
