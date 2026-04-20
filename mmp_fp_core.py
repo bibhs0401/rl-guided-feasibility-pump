@@ -120,7 +120,7 @@ class FPRunConfig:
     """
     max_iterations: int = 100
     time_limit: float = 30.0
-    initial_lp_time_limit: float | None = 180.0
+    initial_lp_time_limit: float | None = 200.0
     stall_threshold: int = 3
     max_stalls: int = 50
     recent_delta_window: int = 5
@@ -1120,7 +1120,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--initial-lp-time-limit",
         type=float,
-        default=30.0,
+        default=200.0,
         help="Separate time limit in seconds for the initial LP relaxation solve.",
     )
     args = parser.parse_args()
