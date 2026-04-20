@@ -1163,8 +1163,3 @@ if __name__ == "__main__":
 
     summary = run_single_fp_episode(args.instance, cfg)
     print(json.dumps(summary, indent=2))
-olve_seconds": runner.initial_lp_solve_seconds,
-        "reset_seconds": runner.reset_seconds,
-        "final_distance": runner.current_distance(),
-        "elapsed_seconds": 0.0 if runner.start_time is None else (time.time() - runner.start_time),
-    }
