@@ -93,9 +93,8 @@ def make_env_fn(
             max_reset_resamples=max_reset_resamples,
             seed=seed,
         )
-        env = FeasibilityPumpRLEnv(env_cfg)
-        env = Monitor(env)
-        return env
+        # VecMonitor wraps the vectorized env outside — no inner Monitor needed.
+        return FeasibilityPumpRLEnv(env_cfg)
 
     return _init
 

@@ -271,9 +271,11 @@ class FeasibilityPumpRLEnv(gym.Env):
 
             problem, runner = self._instance_cache[idx]
 
-            logger.debug(
-                "[reset] attempt=%d/%d  instance=%s",
-                attempt + 1, self.config.max_reset_resamples, problem.instance_path,
+            logger.info(
+                "[reset ep=%d] attempt=%d/%d  instance=%s  (resetting LP …)",
+                self.episode_id + 1,
+                attempt + 1, self.config.max_reset_resamples,
+                Path(problem.instance_path).name,
             )
 
             # Fast state reset — reuses pre-built CPLEX models
@@ -291,15 +293,21 @@ class FeasibilityPumpRLEnv(gym.Env):
             last_runner = runner
 
             if runner.failed:
-                logger.debug("[reset] skipping: reset_state failed")
+                logger.info("[reset ep=%d] skipping %s — reset_state failed",
+                            self.episode_id + 1, Path(problem.instance_path).name)
                 continue
 
             if runner.terminated_in_initial_relaxation:
-                logger.debug("[reset] skipping: solved in initial relaxation")
+                logger.info("[reset ep=%d] skipping %s — solved in initial LP (trivial)",
+                            self.episode_id + 1, Path(problem.instance_path).name)
                 continue
 
             # Advance naturally to the first decision point
             if not runner.done:
+                logger.info(
+                    "[reset ep=%d] running FP on %s until first stall …",
+                    self.episode_id + 1, Path(problem.instance_path).name,
+                )
                 runner.advance_until_stall_or_done()
                 logger.debug(
                     "[reset] after natural advance: done=%s stalled=%s "
@@ -309,10 +317,16 @@ class FeasibilityPumpRLEnv(gym.Env):
                 )
 
             if (not runner.done) and (not runner.failed) and runner.is_stalled():
-                logger.debug("[reset] accepted: decision point reached")
+                logger.info(
+                    "[reset ep=%d] ready — %s  iters=%d  dist=%.4f",
+                    self.episode_id + 1, Path(problem.instance_path).name,
+                    runner.iteration, runner.current_distance(),
+                )
                 return problem, runner
 
-            logger.debug("[reset] rejected: no usable RL decision point")
+            logger.info("[reset ep=%d] rejected %s — no usable decision point (done=%s failed=%s)",
+                        self.episode_id + 1, Path(problem.instance_path).name,
+                        runner.done, runner.failed)
 
         # Fallback: use the last sampled runner rather than looping forever.
         # Log a warning so the user knows the pool quality is poor.
