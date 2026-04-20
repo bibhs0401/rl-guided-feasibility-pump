@@ -226,12 +226,18 @@ class FeasibilityPumpRLEnv(gym.Env):
             runner = FeasibilityPumpCore(problem, self.config.fp_config)
             runner.build_models()
             self._instance_cache.append((problem, runner))
+            lp_ok = runner._cached_lp_result is not None
             logger.info(
-                "[init] built %d/%d  %s  (relax=%.1fs  dist=%.1fs)",
-                i + 1, len(config.instance_paths), path,
+                "[init] built %d/%d  %s  (relax=%.1fs  dist=%.1fs  lp=%.1fs  lp_ok=%s)",
+                i + 1, len(config.instance_paths), Path(path).name,
                 runner.relaxation_build_seconds, runner.distance_build_seconds,
+                runner.initial_lp_solve_seconds, lp_ok,
             )
-        logger.info("[init] all models built — env ready")
+        n_ok = sum(1 for _, r in self._instance_cache if r._cached_lp_result is not None)
+        logger.info(
+            "[init] all models built — %d/%d instances have a valid cached LP solution",
+            n_ok, len(config.instance_paths),
+        )
 
     # -------------------------------------------------------------------------
     # Reset helpers

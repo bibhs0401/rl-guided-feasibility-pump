@@ -724,11 +724,16 @@ class FeasibilityPumpCore:
 
     def build_models(self) -> None:
         """
-        Build the two reusable CPLEX LP models for this instance.
+        Build the two reusable CPLEX LP models and solve the initial LP once.
 
         This is the slow, one-time-per-instance step.  For a fixed
         training pool, call this once at environment initialisation and
-        reuse the models across all episodes via reset_state().
+        reuse the models (and the cached LP solution) across all episodes
+        via reset_state().
+
+        The initial LP solution is cached so that reset_state() can restore
+        it instantly without re-solving — critical for large instances where
+        the LP solve itself takes minutes.
         """
         build_started = time.time()
         self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
@@ -743,6 +748,19 @@ class FeasibilityPumpCore:
             cplex_threads=self.config.cplex_threads,
         )
         self.distance_build_seconds = time.time() - build_started
+
+        # Solve the initial LP once and cache the result.
+        # reset_state() copies from this cache instead of re-solving.
+        lp_started = time.time()
+        lp_result = solve_relaxation_model(
+            self.relaxation_model,
+            self.relaxation_x,
+            self.relaxation_y,
+            max_seconds=self.config.initial_lp_time_limit,
+        )
+        self.initial_lp_solve_seconds = time.time() - lp_started
+        # Store as a tuple (x_relaxed, y_values, lp_obj) or None if failed.
+        self._cached_lp_result = lp_result
 
     def reset_state(self) -> None:
         """
@@ -786,17 +804,12 @@ class FeasibilityPumpCore:
         self.x_rounded = None
         self.y_values = None
 
-        # Solve the initial LP relaxation using the pre-built model
+        # Restore the initial LP solution from the cache built in build_models().
+        # This avoids re-solving the LP on every episode — for large instances
+        # (m=9000, n=3000) that solve takes 200+ seconds; the cache makes it
+        # near-instant by copying the already-computed arrays.
         self.start_time = None
-
-        solve_started = time.time()
-        result = solve_relaxation_model(
-            self.relaxation_model,
-            self.relaxation_x,
-            self.relaxation_y,
-            max_seconds=self.config.initial_lp_time_limit,
-        )
-        self.initial_lp_solve_seconds = time.time() - solve_started
+        result = getattr(self, "_cached_lp_result", None)
 
         if result is None:
             self.failed = True
@@ -804,7 +817,12 @@ class FeasibilityPumpCore:
             self.reset_seconds = time.time() - reset_started
             return
 
-        self.x_relaxed, self.y_values, self.initial_lp_objective = result
+        # Copy the cached lists so FP iterations can mutate x_relaxed freely
+        # without corrupting the stored initial solution.
+        cached_x, cached_y, cached_obj = result
+        self.x_relaxed = list(cached_x)
+        self.y_values  = list(cached_y)
+        self.initial_lp_objective = cached_obj
         self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
         self.initial_distance = fp_distance(
             self.x_relaxed, self.x_rounded, self.problem.integer_indices,
