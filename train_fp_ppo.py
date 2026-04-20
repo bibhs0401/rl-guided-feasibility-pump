@@ -74,6 +74,7 @@ def make_env_fn(
     seed: int,
     max_iterations: int,
     time_limit: float,
+    initial_lp_time_limit: float,
     stall_threshold: int,
     max_stalls: int,
     cplex_threads: int,
@@ -83,6 +84,7 @@ def make_env_fn(
         fp_cfg = FPRunConfig(
             max_iterations=max_iterations,
             time_limit=time_limit,
+            initial_lp_time_limit=initial_lp_time_limit,
             stall_threshold=stall_threshold,
             max_stalls=max_stalls,
             cplex_threads=cplex_threads,
@@ -367,6 +369,12 @@ def main():
     # Environment / FP
     parser.add_argument("--max-iterations",     type=int,   default=100)
     parser.add_argument("--time-limit",         type=float, default=30.0)
+    parser.add_argument(
+        "--initial-lp-time-limit",
+        type=float,
+        default=200.0,
+        help="Time limit in seconds for the initial LP relaxation solve during reset.",
+    )
     parser.add_argument("--stall-threshold",    type=int,   default=3)
     parser.add_argument("--max-stalls",         type=int,   default=50)
     parser.add_argument("--cplex-threads",      type=int,   default=1)
@@ -478,6 +486,7 @@ def main():
         probe = make_env_fn(
             instance_paths=instance_paths, seed=args.seed,
             max_iterations=args.max_iterations, time_limit=args.time_limit,
+            initial_lp_time_limit=args.initial_lp_time_limit,
             stall_threshold=args.stall_threshold, max_stalls=args.max_stalls,
             cplex_threads=args.cplex_threads,
             max_reset_resamples=args.max_reset_resamples,
@@ -492,6 +501,7 @@ def main():
         instance_paths=instance_paths,
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
+        initial_lp_time_limit=args.initial_lp_time_limit,
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,

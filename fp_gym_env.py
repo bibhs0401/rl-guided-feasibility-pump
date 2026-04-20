@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+_FRAC_EPS = 1e-6
 
 import gymnasium as gym
 import numpy as np
@@ -178,7 +179,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         # ---------------------------------------------------------------------
         self.observation_space = spaces.Dict(
             {
-                "progress": spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32),
+                "progress": spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32),
                 "history": spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32),
                 "instance": spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32),
             }
@@ -194,14 +195,16 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.total_reward = 0.0
         self.termination_reason = ""
 
-        # Best-so-far distance
+        # Best-so-far progress stats
         self.best_distance = 0.0
+        self.best_nfracs = 0
 
         # History features
         self.prev_reward = 0.0
         self.prev_prev_reward = 0.0
         self.prev_dist_delta = 0.0
         self.prev_prev_dist_delta = 0.0
+        self.prev_nfracs = 0
         self.last_action_caused_stall = False
         self.last_action_broke_stall = False
         self.cumulative_flips = 0
@@ -341,83 +344,55 @@ class FeasibilityPumpRLEnv(gym.Env):
     # -------------------------------------------------------------------------
     # Feature builders
     # -------------------------------------------------------------------------
+    def _count_fractional_binaries(self) -> int:
+        """Count binary-designated vars that are currently fractional."""
+        assert self.runner is not None
+        assert self.problem is not None
+        if self.runner.x_relaxed is None:
+            return 0
+        return int(sum(
+            abs(self.runner.x_relaxed[idx] - round(self.runner.x_relaxed[idx])) > _FRAC_EPS
+            for idx in self.problem.integer_indices
+        ))
+
     def _build_progress_features(self) -> np.ndarray:
         """
-        Build the 12-dim 'progress' feature vector.
-
-        Chosen to match the experiment design:
-        - current fractionality / distance status
-        - stall status
-        - iteration progress
-        - time usage
-        - last perturbation info
+        Build a 7-dim hybrid progress vector:
+        [nfracs, best_nfracs, nfracs_improve, distance, distance_improve, elapsed, last_flip].
         """
         assert self.runner is not None
         assert self.problem is not None
 
         n_integer = max(1, len(self.problem.integer_indices))
+        nfracs = self._count_fractional_binaries()
+
+        nfracs_ratio = nfracs / n_integer
+        best_nfracs_ratio = self.best_nfracs / n_integer
+        nfracs_improve = float(np.clip((self.prev_nfracs - nfracs) / n_integer, -1.0, 1.0))
 
         current_distance = self.runner.current_distance()
         current_distance_norm = min(1.0, current_distance / n_integer)
-        best_distance_norm = min(1.0, self.best_distance / n_integer)
+        dist_improve = float(np.clip(self.prev_dist_delta / n_integer, -1.0, 1.0))
 
-        # Improvement from previous step
-        dist_improve = self.prev_dist_delta / n_integer
-        dist_improve = float(np.clip(dist_improve, -1.0, 1.0))
-
-        # Binary flag: is FP currently at a decision point (stalled)?
-        # With the 1-event stall semantics, consecutive_no_change is 0 or 1,
-        # so this is more informative than dividing by stall_threshold.
-        at_decision_point = 1.0 if self.runner.is_stalled() else 0.0
-
-        iter_ratio = min(
-            1.0,
-            self.runner.iteration / max(1, self.runner.config.max_iterations),
+        elapsed = (
+            0.0 if self.runner.start_time is None
+            else self.runner.config.time_limit - max(0.0, self.runner.remaining_time() or 0.0)
         )
-
-        elapsed = 0.0 if self.runner.start_time is None else (self.runner.config.time_limit - max(0.0, self.runner.remaining_time() or 0.0))
         elapsed_ratio = min(1.0, elapsed / max(1e-8, self.runner.config.time_limit))
-        remaining_ratio = min(
-            1.0,
-            max(0.0, self.runner.remaining_time() or 0.0) / max(1e-8, self.runner.config.time_limit),
-        )
-
         last_flip_ratio = min(1.0, self.runner.last_k / n_integer)
-        # How many stall events have accumulated relative to the budget?
-        # Replaces current_cycle_flag which could never be True with 1-event stalls.
-        stall_event_ratio = min(1.0, self.runner.stall_events / max(1, self.runner.config.max_stalls))
-        feasible_found_flag = 1.0 if self.runner.integer_found else 0.0
-
-        # Use the runner's recent distance deltas as a compact progress signal
-        recent_delta = 0.0
-        if self.runner.recent_distance_deltas:
-            recent_delta = float(np.mean(self.runner.recent_distance_deltas)) / n_integer
-            recent_delta = float(np.clip(recent_delta, -1.0, 1.0))
-
-        objective_degradation_from_lp = 0.0
-        if self.runner.initial_lp_objective != 0.0 and self.runner.y_values is not None:
-            current_sum_y = float(np.sum(self.runner.y_values))
-            objective_degradation_from_lp = (self.runner.initial_lp_objective - current_sum_y) / (abs(self.runner.initial_lp_objective) + 1.0)
-            objective_degradation_from_lp = float(np.clip(objective_degradation_from_lp, -1.0, 1.0))
 
         progress = np.array(
             [
-                current_distance_norm,          # 0  current dist / n_int
-                best_distance_norm,             # 1  best dist / n_int
-                dist_improve,                   # 2  improvement this step
-                at_decision_point,              # 3  1 = stalled, 0 = running  (Fix 2)
-                iter_ratio,                     # 4  iterations used
-                elapsed_ratio,                  # 5  time used
-                remaining_ratio,                # 6  time remaining
-                last_flip_ratio,                # 7  flip size / n_int
-                stall_event_ratio,              # 8  stall count / max_stalls  (Fix 2)
-                feasible_found_flag,            # 9  1 = integer solution found
-                recent_delta,                   # 10 mean recent dist delta
-                objective_degradation_from_lp,  # 11 LP obj degradation
+                float(np.clip(nfracs_ratio, 0.0, 1.0)),
+                float(np.clip(best_nfracs_ratio, 0.0, 1.0)),
+                nfracs_improve,
+                float(np.clip(current_distance_norm, 0.0, 1.0)),
+                dist_improve,
+                float(np.clip(elapsed_ratio, 0.0, 1.0)),
+                float(np.clip(last_flip_ratio, 0.0, 1.0)),
             ],
             dtype=np.float32,
         )
-
         return np.clip(progress, -1.0, 1.0)
 
     def _build_history_features(self) -> np.ndarray:
@@ -596,6 +571,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.prev_prev_reward = 0.0
         self.prev_dist_delta = 0.0
         self.prev_prev_dist_delta = 0.0
+        self.prev_nfracs = 0
         self.last_action_caused_stall = False
         self.last_action_broke_stall = False
         self.cumulative_flips = 0
@@ -610,6 +586,9 @@ class FeasibilityPumpRLEnv(gym.Env):
         # _load_nontrivial_instance() already advances to the first usable
         # decision point when possible.
         self.best_distance = self.runner.current_distance()
+        current_nfracs = self._count_fractional_binaries()
+        self.best_nfracs = current_nfracs
+        self.prev_nfracs = current_nfracs
 
         observation = self._build_observation()
         logger.info(
@@ -683,6 +662,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         # Save state before acting
         prev_distance = self.runner.current_distance()
         prev_best_distance = self.best_distance
+        prev_nfracs = self._count_fractional_binaries()
         prev_stalled = self.runner.is_stalled()
 
         remaining_before = self.runner.remaining_time()
@@ -712,6 +692,8 @@ class FeasibilityPumpRLEnv(gym.Env):
         # ---------------------------------------------------------------------
         new_distance = self.runner.current_distance()
         self.best_distance = min(self.best_distance, new_distance)
+        new_nfracs = self._count_fractional_binaries()
+        self.best_nfracs = min(self.best_nfracs, new_nfracs)
 
         remaining_after = self.runner.remaining_time()
         elapsed_after = (
@@ -744,6 +726,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         # Update short-term history
         self.prev_prev_dist_delta = self.prev_dist_delta
         self.prev_dist_delta = dist_delta
+        self.prev_nfracs = prev_nfracs
         self.prev_prev_reward = self.prev_reward
         self.prev_reward = reward
 
