@@ -751,15 +751,19 @@ class FeasibilityPumpCore:
 
         # Solve the initial LP once and cache the result.
         # reset_state() copies from this cache instead of re-solving.
+        #
+        # No time limit here — this is a one-time startup cost and we must
+        # let it run to completion. The initial_lp_time_limit in FPRunConfig
+        # was designed for per-episode resets, which no longer re-solve the LP.
         lp_started = time.time()
         lp_result = solve_relaxation_model(
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=self.config.initial_lp_time_limit,
+            max_seconds=None,  # no cap: solve to completion once
         )
         self.initial_lp_solve_seconds = time.time() - lp_started
-        # Store as a tuple (x_relaxed, y_values, lp_obj) or None if failed.
+        # Store as a tuple (x_relaxed, y_values, lp_obj) or None if infeasible.
         self._cached_lp_result = lp_result
 
     def reset_state(self) -> None:
@@ -1159,3 +1163,8 @@ if __name__ == "__main__":
 
     summary = run_single_fp_episode(args.instance, cfg)
     print(json.dumps(summary, indent=2))
+olve_seconds": runner.initial_lp_solve_seconds,
+        "reset_seconds": runner.reset_seconds,
+        "final_distance": runner.current_distance(),
+        "elapsed_seconds": 0.0 if runner.start_time is None else (time.time() - runner.start_time),
+    }

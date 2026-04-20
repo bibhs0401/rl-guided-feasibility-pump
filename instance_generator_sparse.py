@@ -12,7 +12,14 @@ import numpy as np
 from scipy import sparse
 
 
-def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None, n=4000):
+def generate_instance(
+    seed=None,
+    verbose=False,
+    progress_every_rows=1000,
+    p=None,
+    n=4000,
+    a=3.0,
+):
     if seed is not None:
         random.seed(seed)
 
@@ -20,7 +27,9 @@ def generate_instance(seed=None, verbose=False, progress_every_rows=1000, p=None
     if n < 1:
         raise ValueError("n must be >= 1")
 
-    m = n * 3 # a = 2 is the multiplier for the number of constraints
+    m = int(round(n * float(a)))
+    if m < 1:
+        raise ValueError("m must be >= 1; increase --a or --n")
     if p is None:
         p = 3
     else:
@@ -160,8 +169,14 @@ def parse_args():
         default=None,
         help=(
             "Fixed number of decision variables (overrides --random-n). "
-            "The number of constraints is set to 2 * n."
+            "The number of constraints is set to round(a * n)."
         ),
+    )
+    parser.add_argument(
+        "--a",
+        type=float,
+        default=3.0,
+        help="Multiplier used to compute constraints count: m = round(a * n).",
     )
     parser.add_argument(
         "--random-n",
@@ -205,6 +220,7 @@ if __name__ == "__main__":
             progress_every_rows=args.progress_every_rows,
             p=args.p,
             n=n_i,
+            a=args.a,
         )
         path = os.path.join(out_dir, f"instance_{i+1}.npz")
         print(f"  [save] Writing {path}")
