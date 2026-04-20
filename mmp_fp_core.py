@@ -23,6 +23,22 @@ from scipy import sparse
 logger = logging.getLogger(__name__)
 
 
+# Optional: CPLEX low-level API for fast bulk constraint building.
+# This module ships with every CPLEX installation (academic or commercial).
+# If it is not importable for some reason, we fall back to the docplex
+# row-by-row approach automatically.
+try:
+    import cplex as _cplex_module
+    _FAST_CONSTRAINTS = True
+except ImportError:
+    _FAST_CONSTRAINTS = False
+    logger.warning(
+        "cplex low-level module not importable. "
+        "Falling back to row-by-row constraint building (slow for large instances). "
+        "Make sure the CPLEX installation directory is on PYTHONPATH."
+    )
+
+
 # -----------------------------------------------------------------------------
 # Global constants
 # -----------------------------------------------------------------------------
@@ -336,6 +352,76 @@ def solve_with_time_limit(model: Model, max_seconds: Optional[float]):
 
 
 # -----------------------------------------------------------------------------
+# Fast bulk constraint helpers
+# -----------------------------------------------------------------------------
+# These two helpers replace the slow Python-level row-by-row loops in the
+# model builders below.  Both require the cplex low-level module.
+#
+# Why this is faster:
+#   docplex builds a Python expression tree for every constraint and then
+#   translates it into CPLEX API calls one at a time.  For a 9000-row sparse
+#   matrix that means ~9000 individual Python -> C boundary crossings.
+#   The CPLEX low-level API accepts the entire sparse matrix as a single list
+#   of SparsePair objects and performs one bulk C-level call, which is
+#   typically 20-50x faster for large instances.
+#
+# Safety note on mixing docplex and the low-level API:
+#   Constraints added via cpx.linear_constraints.add() are invisible to
+#   docplex's internal constraint registry, but that is fine here because
+#   (a) we never ask docplex to remove or look up the Ax<=b rows, and
+#   (b) the dynamic distance constraint in solve_distance_model() is added
+#       and removed exclusively through docplex, so its internal IDs are
+#       unaffected by the bulk-added rows.
+# -----------------------------------------------------------------------------
+
+def _add_Axb_bulk(model: Model, A: sparse.csr_matrix, b: np.ndarray) -> None:
+    """
+    Add all Ax <= b constraints to a docplex model in a single bulk call
+    using the CPLEX low-level Python API.
+
+    Precondition
+    ------------
+    The decision variables (x or z) must be the FIRST n columns of the model,
+    so that A's CSR column indices (0 .. n-1) map directly to CPLEX variable
+    indices.  Both build_relaxation_model and build_distance_model satisfy this
+    because they add x / z before anything else.
+    """
+    cpx = model.cplex
+    m = A.shape[0]
+
+    lin_expr = [
+        _cplex_module.SparsePair(
+            ind=A.indices[A.indptr[i] : A.indptr[i + 1]].tolist(),
+            val=A.data[A.indptr[i] : A.indptr[i + 1]].tolist(),
+        )
+        for i in range(m)
+    ]
+
+    cpx.linear_constraints.add(
+        lin_expr=lin_expr,
+        senses=["L"] * m,
+        rhs=b.tolist(),
+    )
+
+
+def _set_integer_upper_bounds(model: Model, integer_indices: Sequence[int]) -> None:
+    """
+    Set x[i] <= 1 for all integer-designated variables by updating variable
+    upper bounds directly via the CPLEX low-level API.
+
+    Using variable bounds instead of explicit <= constraints removes 0.8*n
+    extra rows from the LP, which makes each solve slightly faster too.
+
+    Precondition
+    ------------
+    Variable j must have CPLEX column index j, which holds when the x / z
+    variable list is created as the first block of variables in the model.
+    """
+    cpx = model.cplex
+    cpx.variables.set_upper_bounds([(int(idx), 1.0) for idx in integer_indices])
+
+
+# -----------------------------------------------------------------------------
 # Model builders
 # -----------------------------------------------------------------------------
 # We build two models:
@@ -368,17 +454,29 @@ def build_relaxation_model(problem: ProblemInstance, cplex_threads: int = 1):
     y = model.continuous_var_list(problem.p, name="y")
 
     # Constraint system Ax <= b
-    for row_idx in range(problem.m):
-        model.add_constraint(
-            model.sum(val * x[col_idx] for col_idx, val in iter_csr_row(problem.A, row_idx))
-            <= problem.b[row_idx]
-        )
+    # Fast path: one bulk CPLEX call instead of m individual docplex calls.
+    # Fall back to the row-by-row docplex loop only if the cplex module is
+    # not available (should not happen when CPLEX is properly installed).
+    if _FAST_CONSTRAINTS:
+        _add_Axb_bulk(model, problem.A, problem.b)
+    else:
+        for row_idx in range(problem.m):
+            model.add_constraint(
+                model.sum(val * x[col_idx] for col_idx, val in iter_csr_row(problem.A, row_idx))
+                <= problem.b[row_idx]
+            )
 
-    # Integer-designated variables are relaxed to [0, 1]
-    for idx in problem.integer_indices:
-        model.add_constraint(x[idx] <= 1)
+    # Integer-designated variables are relaxed to [0, 1].
+    # Fast path: set as variable upper bounds rather than explicit constraints,
+    # which keeps the LP smaller and is faster to set.
+    if _FAST_CONSTRAINTS:
+        _set_integer_upper_bounds(model, problem.integer_indices)
+    else:
+        for idx in problem.integer_indices:
+            model.add_constraint(x[idx] <= 1)
 
     # Objective-image constraints: y_i = c_i x + d_i
+    # Only p = 2 or 3 of these, so the docplex loop is negligible.
     for obj_idx in range(problem.p):
         expr = model.sum(val * x[col_idx] for col_idx, val in iter_vector_nonzero(problem.c[obj_idx]))
         model.add_constraint(expr + float(problem.d[obj_idx]) == y[obj_idx])
@@ -428,16 +526,22 @@ def build_distance_model(problem: ProblemInstance, cplex_threads: int = 1):
     y = model.continuous_var_list(problem.p, name="y")
     distance_var = model.continuous_var(lb=0, name="distance")
 
-    # Constraint system A z <= b
-    for row_idx in range(problem.m):
-        model.add_constraint(
-            model.sum(val * z[col_idx] for col_idx, val in iter_csr_row(problem.A, row_idx))
-            <= problem.b[row_idx]
-        )
+    # Constraint system A z <= b — same fast/fallback pattern as the relaxation model
+    if _FAST_CONSTRAINTS:
+        _add_Axb_bulk(model, problem.A, problem.b)
+    else:
+        for row_idx in range(problem.m):
+            model.add_constraint(
+                model.sum(val * z[col_idx] for col_idx, val in iter_csr_row(problem.A, row_idx))
+                <= problem.b[row_idx]
+            )
 
     # Integer-designated variables are still relaxed in [0, 1]
-    for idx in problem.integer_indices:
-        model.add_constraint(z[idx] <= 1)
+    if _FAST_CONSTRAINTS:
+        _set_integer_upper_bounds(model, problem.integer_indices)
+    else:
+        for idx in problem.integer_indices:
+            model.add_constraint(z[idx] <= 1)
 
     # Objective-image constraints
     for obj_idx in range(problem.p):
@@ -995,13 +1099,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Simple console logging setup
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
-    # Build the FP run configuration from CLI args
     cfg = FPRunConfig(
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
@@ -1011,6 +1113,5 @@ if __name__ == "__main__":
         initial_lp_time_limit=args.initial_lp_time_limit,
     )
 
-    # Run one real FP episode and print the summary
     summary = run_single_fp_episode(args.instance, cfg)
     print(json.dumps(summary, indent=2))
