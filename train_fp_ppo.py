@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv as _csv
 import json
+import logging
 import os
 import sys
 from collections import defaultdict, deque
@@ -412,6 +413,18 @@ def main():
     run_dir = Path(args.run_dir) / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── logging setup ────────────────────────────────────────────────────
+    # Show INFO from fp_gym_env (instance progress) and mmp_fp_core (model build).
+    # SB3/torch stay at WARNING to avoid noise.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s  %(name)s  %(levelname)s  %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+    logging.getLogger("fp_gym_env").setLevel(logging.INFO)
+    logging.getLogger("mmp_fp_core").setLevel(logging.INFO)
+
     checkpoint_dir = (
         args.checkpoint_dir if args.checkpoint_dir
         else str(run_dir / "checkpoints")
@@ -526,6 +539,42 @@ def main():
     # ── train ────────────────────────────────────────────────────────────
     print("[info] starting PPO training ...", flush=True)
     model.learn(total_timesteps=args.total_timesteps, callback=callback)
+
+    # ── save final model (name includes shape + timestamp) ───────────────
+    final_model = str(run_dir / f"{args.save_name}_{shape_tag}_{timestamp}")
+    print(f"[info] saving model -> {final_model}.zip", flush=True)
+    model.save(final_model)
+
+    vec_env.close()
+    print("[info] training complete", flush=True)
+    print(f"[info] csv log    : {csv_log_path}", flush=True)
+    if log_file:
+        print(f"[info] stdout log : {log_file}", flush=True)
+    if _tee is not None:
+        _tee.close()
+
+
+if __name__ == "__main__":
+    main()
+.total_timesteps, callback=callback)
+
+    # ── save final model (name includes shape + timestamp) ───────────────
+    final_model = str(run_dir / f"{args.save_name}_{shape_tag}_{timestamp}")
+    print(f"[info] saving model -> {final_model}.zip", flush=True)
+    model.save(final_model)
+
+    vec_env.close()
+    print("[info] training complete", flush=True)
+    print(f"[info] csv log    : {csv_log_path}", flush=True)
+    if log_file:
+        print(f"[info] stdout log : {log_file}", flush=True)
+    if _tee is not None:
+        _tee.close()
+
+
+if __name__ == "__main__":
+    main()
+otal_timesteps=args.total_timesteps, callback=callback)
 
     # ── save final model (name includes shape + timestamp) ───────────────
     final_model = str(run_dir / f"{args.save_name}_{shape_tag}_{timestamp}")

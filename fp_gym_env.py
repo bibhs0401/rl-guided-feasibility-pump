@@ -598,7 +598,14 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.best_distance = self.runner.current_distance()
 
         observation = self._build_observation()
-        logger.debug("[reset] episode=%d  instance=%s", self.episode_id, self.problem.instance_path)
+        logger.info(
+            "[episode %d] instance=%s  m=%d n=%d p=%d  dist0=%.4f  stalls_so_far=%d",
+            self.episode_id,
+            Path(self.problem.instance_path).name,
+            self.problem.m, self.problem.n, self.problem.p,
+            self.runner.current_distance(),
+            self.runner.stall_events,
+        )
         info = {
             "episode_id": self.episode_id,
             "instance_path": self.problem.instance_path if self.problem is not None else None,
@@ -786,6 +793,13 @@ class FeasibilityPumpRLEnv(gym.Env):
             "step_runtime": step_runtime,
             "elapsed_seconds": elapsed_after,
             "remaining_seconds": max(0.0, self.runner.remaining_time() or 0.0),
+
+            "terminated": terminated,
+            "truncated": truncated,
+            "termination_reason": self.termination_reason,
+        }
+
+        return observation, float(reward), terminated, truncated, infoaining_time() or 0.0),
 
             "terminated": terminated,
             "truncated": truncated,
