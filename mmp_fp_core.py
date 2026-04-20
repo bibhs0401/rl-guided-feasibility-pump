@@ -706,24 +706,60 @@ class FeasibilityPumpCore:
             return 0.0
         return fp_distance(self.x_relaxed, self.x_rounded, self.problem.integer_indices)
 
-    def reset(self) -> None:
+    # ------------------------------------------------------------------
+    # Two-phase initialisation
+    # ------------------------------------------------------------------
+    # build_models()  — build the CPLEX LP objects once per instance.
+    #                   Call this at pool-construction time so the cost
+    #                   is paid once rather than every episode.
+    #
+    # reset_state()   — reset episode counters and re-solve the initial
+    #                   LP using the already-built models.  Fast: no
+    #                   model rebuild.
+    #
+    # reset()         — convenience wrapper that calls both in sequence.
+    #                   Kept for backward-compatibility with code that
+    #                   creates a fresh runner per episode.
+    # ------------------------------------------------------------------
+
+    def build_models(self) -> None:
         """
-        Initialize one FP run.
+        Build the two reusable CPLEX LP models for this instance.
+
+        This is the slow, one-time-per-instance step.  For a fixed
+        training pool, call this once at environment initialisation and
+        reuse the models across all episodes via reset_state().
+        """
+        build_started = time.time()
+        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
+            self.problem,
+            cplex_threads=self.config.cplex_threads,
+        )
+        self.relaxation_build_seconds = time.time() - build_started
+
+        build_started = time.time()
+        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
+            self.problem,
+            cplex_threads=self.config.cplex_threads,
+        )
+        self.distance_build_seconds = time.time() - build_started
+
+    def reset_state(self) -> None:
+        """
+        Reset all FP episode state and solve the initial LP relaxation.
+
+        Assumes build_models() has already been called.  Does NOT rebuild
+        the CPLEX models, so it is fast enough to call at the start of
+        every training episode.
 
         Baseline-matching behavior
         --------------------------
-        In main_phase1.py, the initial LP relaxation is solved BEFORE the
-        feasibility-pump loop timer starts. The FP time limit applies to the
-        iterative FP loop, not to the initial LP solve itself.
-
-        Practical safeguard
-        -------------------
-        We add a separate optional initial_lp_time_limit so reset() does not
-        hang for a very long time on difficult instances.
+        The initial LP is solved BEFORE the FP-loop timer starts, matching
+        the semantics of main_phase1.py.
         """
         reset_started = time.time()
 
-        # Reset all episode counters / state
+        # Clear all episode counters and solution state
         self.iteration = 0
         self.done = False
         self.failed = False
@@ -741,8 +777,8 @@ class FeasibilityPumpCore:
         self.terminated_in_initial_relaxation = False
         self.initial_distance = 0.0
 
-        self.relaxation_build_seconds = 0.0
-        self.distance_build_seconds = 0.0
+        # Build times are not reset here — they reflect the one-time cost
+        # from build_models() and remain valid across episodes.
         self.initial_lp_solve_seconds = 0.0
         self.reset_seconds = 0.0
 
@@ -750,27 +786,7 @@ class FeasibilityPumpCore:
         self.x_rounded = None
         self.y_values = None
 
-        # -------------------------------------------------------------
-        # Build reusable docplex models
-        # -------------------------------------------------------------
-        build_started = time.time()
-        self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
-            self.problem,
-            cplex_threads=self.config.cplex_threads,
-        )
-        self.relaxation_build_seconds = time.time() - build_started
-
-        build_started = time.time()
-        self.distance_model, self.distance_z, self.distance_y, self.distance_var = build_distance_model(
-            self.problem,
-            cplex_threads=self.config.cplex_threads,
-        )
-        self.distance_build_seconds = time.time() - build_started
-
-        # -------------------------------------------------------------
-        # Important baseline-matching behavior:
-        # solve the initial LP BEFORE starting the FP-loop timer.
-        # -------------------------------------------------------------
+        # Solve the initial LP relaxation using the pre-built model
         self.start_time = None
 
         solve_started = time.time()
@@ -789,24 +805,14 @@ class FeasibilityPumpCore:
             return
 
         self.x_relaxed, self.y_values, self.initial_lp_objective = result
-
-        # Build the first rounded point from the initial LP solution
         self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
-
-        # Record the initial FP distance before any FP iteration happens
         self.initial_distance = fp_distance(
-            self.x_relaxed,
-            self.x_rounded,
-            self.problem.integer_indices,
+            self.x_relaxed, self.x_rounded, self.problem.integer_indices,
         )
-
-        # Check whether the initial LP solution is already integer-feasible
         self.initial_solution_was_integer = is_integer_solution(
-            self.x_relaxed,
-            self.problem.integer_indices,
+            self.x_relaxed, self.problem.integer_indices,
         )
 
-        # If yes, the run terminates before the FP loop starts
         if self.initial_solution_was_integer:
             self.integer_found = True
             self.done = True
@@ -814,12 +820,20 @@ class FeasibilityPumpCore:
             self.reset_seconds = time.time() - reset_started
             return
 
-        # -------------------------------------------------------------
-        # Only now do we start the FP-loop timer.
-        # This matches main_phase1.py semantics more closely.
-        # -------------------------------------------------------------
+        # FP-loop timer starts only after the initial LP is solved
         self.start_time = time.time()
         self.reset_seconds = time.time() - reset_started
+
+    def reset(self) -> None:
+        """
+        Full reset: build CPLEX models AND reset episode state.
+
+        Convenience wrapper kept for backward compatibility.
+        For a fixed training pool, prefer calling build_models() once
+        at startup and reset_state() at the start of each episode.
+        """
+        self.build_models()
+        self.reset_state()
 
     def is_stalled(self) -> bool:
         """
@@ -962,28 +976,40 @@ class FeasibilityPumpCore:
 
         return True
 
-    def advance_until_stall_or_done(self) -> None:
+    def advance_until_stall_or_done(self, max_steps: int = 999_999) -> None:
         """
         Run natural FP steps (no manual flip) until:
         - FP is done, or
-        - a no-change event occurs and a flip decision is needed.
+        - a no-change event occurs (decision point), or
+        - max_steps natural iterations have been executed.
+
+        Parameters
+        ----------
+        max_steps : int
+            Maximum number of natural FP iterations to run before returning
+            control to the caller, even if no stall has been detected.
+            Defaults to a large sentinel so existing call-sites that omit the
+            argument are unaffected.
+
+            The RL agent uses this to implement the continuation / patience
+            action: a larger value lets FP run longer before the next
+            intervention; a smaller value returns control sooner.
 
         Baseline-matching intent
         ------------------------
-        In main_phase1.py, once the distance-projection step produces a relaxed
-        point whose rounding does not change the current rounded guide point,
-        the algorithm flips immediately. It does not wait for several repeated
-        no-change rounds.
-
-        So here we stop natural advancement as soon as the first no-change event
-        is detected, which becomes the decision point for the caller.
+        Stall detection (is_stalled) fires after a single no-change event,
+        matching the flip-immediately semantics of main_phase1.py.
+        max_steps is an additional early-exit for the RL agent and does not
+        alter the stall definition.
         """
-        while not self.done:
+        steps_taken = 0
+        while not self.done and steps_taken < max_steps:
             executed = self.run_one_iteration([])
             if not executed:
                 break
+            steps_taken += 1
 
-            # As soon as one no-change event occurs, return control.
+            # Return control as soon as a no-change / stall event is detected.
             if self.is_stalled():
                 break
 

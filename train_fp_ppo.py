@@ -91,19 +91,34 @@ def make_env_fn(
 # -----------------------------------------------------------------------------
 class PPOTrainingLogger(BaseCallback):
     """
-    Simple training logger for SB3.
+    Training logger and periodic checkpointer for SB3.
 
     Tracks recent:
     - episode rewards
     - feasible solve rate
     - final distance
     - FP time
+
+    Also saves model checkpoints every ``checkpoint_every`` timesteps when
+    ``checkpoint_dir`` is set.
     """
 
-    def __init__(self, print_every_episodes: int = 5, rolling_window: int = 50, verbose: int = 0):
+    def __init__(
+        self,
+        print_every_episodes: int = 5,
+        rolling_window: int = 50,
+        checkpoint_every: int = 0,
+        checkpoint_dir: str = "",
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.print_every_episodes = max(1, print_every_episodes)
         self.rolling_window = max(1, rolling_window)
+
+        # Fix 7: checkpoint config
+        self.checkpoint_every = checkpoint_every  # 0 = disabled
+        self.checkpoint_dir = checkpoint_dir
+        self._last_checkpoint_step = 0
 
         self.episode_count = 0
         self.reward_hist = deque(maxlen=self.rolling_window)
@@ -112,6 +127,19 @@ class PPOTrainingLogger(BaseCallback):
         self.time_hist = deque(maxlen=self.rolling_window)
 
     def _on_step(self) -> bool:
+        # Fix 7: periodic checkpoint
+        if (
+            self.checkpoint_every > 0
+            and self.checkpoint_dir
+            and self.num_timesteps - self._last_checkpoint_step >= self.checkpoint_every
+        ):
+            ckpt_path = os.path.join(
+                self.checkpoint_dir, f"ppo_step_{self.num_timesteps}"
+            )
+            self.model.save(ckpt_path)
+            print(f"[checkpoint] saved → {ckpt_path}.zip", flush=True)
+            self._last_checkpoint_step = self.num_timesteps
+
         infos = self.locals.get("infos", [])
         dones = self.locals.get("dones", [])
 
@@ -179,12 +207,12 @@ def main():
     parser.add_argument("--stall-threshold", type=int, default=3)
     parser.add_argument("--max-stalls", type=int, default=50)
     parser.add_argument("--cplex-threads", type=int, default=1)
-    parser.add_argument("--max-reset-resamples", type=int, default=5)
+    parser.add_argument("--max-reset-resamples", type=int, default=20)  # Fix 6: was 5
 
     # PPO
-    parser.add_argument("--total-timesteps", type=int, default=20000)
+    parser.add_argument("--total-timesteps", type=int, default=200000)  # Fix 6: was 20000
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--n-steps", type=int, default=1024)
+    parser.add_argument("--n-steps", type=int, default=512)  # Fix 6: was 1024
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--n-epochs", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -200,6 +228,19 @@ def main():
     parser.add_argument("--check-env", action="store_true")
     parser.add_argument("--print-every-episodes", type=int, default=5)
 
+    # Fix 7: periodic checkpointing
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10000,
+        help="Save a model checkpoint every N timesteps. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="",
+        help="Directory for checkpoint files. Defaults to <run-dir>/checkpoints.",
+    )
+
     args = parser.parse_args()
 
     # -------------------------------------------------------------------------
@@ -212,6 +253,11 @@ def main():
 
     model_path = run_dir / args.save_name
     config_path = run_dir / "run_config.json"
+
+    # Fix 7: resolve checkpoint directory (default = <run_dir>/checkpoints)
+    checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir else str(run_dir / "checkpoints")
+    if args.checkpoint_every > 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     device = resolve_device(args.device)
 
@@ -312,6 +358,8 @@ def main():
             PPOTrainingLogger(
                 print_every_episodes=args.print_every_episodes,
                 rolling_window=50,
+                checkpoint_every=args.checkpoint_every,  # Fix 7
+                checkpoint_dir=checkpoint_dir,            # Fix 7
                 verbose=0,
             )
         ]

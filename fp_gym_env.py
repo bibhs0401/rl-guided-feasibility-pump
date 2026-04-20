@@ -13,10 +13,13 @@ from __future__ import annotations
 # - Dict observation for SB3 MultiInputPolicy
 # -----------------------------------------------------------------------------
 
+import logging
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import gymnasium as gym
 import numpy as np
@@ -73,8 +76,12 @@ def flip_bin_to_count(bin_index: int, n_integer: int) -> int:
     raise ValueError(f"Invalid flip bin: {bin_index}")
 
 
-# Continuation bins scale the stall threshold for the next decision window.
-CONTINUATION_MULTIPLIERS = (0.33, 0.67, 1.0, 1.5, 2.5)
+# Continuation bins map to a maximum number of natural FP iterations that
+# may run before control returns to the agent.  A larger value lets FP run
+# longer between interventions; a smaller value returns control sooner.
+# These are genuine action semantics: advance_until_stall_or_done(max_steps)
+# now respects this limit, so the action dimension actually affects behaviour.
+CONTINUATION_MAX_STEPS = (1, 3, 5, 10, 20)
 CONTINUATION_LABELS = ("very_short", "short", "medium", "long", "very_long")
 
 
@@ -200,93 +207,121 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.cumulative_flips = 0
         self.consecutive_non_improving = 0
 
+        # ---------------------------------------------------------------------
+        # Pre-build CPLEX models for every instance in the pool (Fix 3).
+        # build_models() is slow but only runs once per instance at startup.
+        # Each episode calls runner.reset_state() which reuses these models,
+        # eliminating the per-episode rebuild cost.
+        # ---------------------------------------------------------------------
+        logger.info(
+            "[init] pre-building CPLEX models for %d instances …",
+            len(config.instance_paths),
+        )
+        self._instance_cache: List[tuple] = []
+        for i, path in enumerate(config.instance_paths):
+            problem = load_npz_instance(path)
+            runner = FeasibilityPumpCore(problem, self.config.fp_config)
+            runner.build_models()
+            self._instance_cache.append((problem, runner))
+            logger.info(
+                "[init] built %d/%d  %s  (relax=%.1fs  dist=%.1fs)",
+                i + 1, len(config.instance_paths), path,
+                runner.relaxation_build_seconds, runner.distance_build_seconds,
+            )
+        logger.info("[init] all models built — env ready")
+
     # -------------------------------------------------------------------------
     # Reset helpers
     # -------------------------------------------------------------------------
-    def _sample_instance_path(self) -> str:
-        """Randomly sample one instance path from the configured pool."""
-        idx = int(self.rng.integers(0, len(self.config.instance_paths)))
-        return self.config.instance_paths[idx]
+    def _sample_cache_index(self) -> int:
+        """Randomly sample one index from the pre-built instance cache."""
+        return int(self.rng.integers(0, len(self._instance_cache)))
 
     def _load_nontrivial_instance(
         self,
-        requested_path: Optional[str] = None
+        requested_path: Optional[str] = None,
     ) -> Tuple[ProblemInstance, FeasibilityPumpCore]:
         """
-        Load an instance and initialize the FP runner.
+        Pick a cached (problem, runner) pair, reset its FP state, and advance
+        to the first usable decision point.
 
-        Reset policy after Fix 1 / Fix 2:
-        - skip instances solved immediately in the initial LP relaxation
-        - skip instances that fail during reset
-        - advance natural FP until the first decision point
-        - accept as soon as the runner is at a usable RL state
-        - if no such state is found after several attempts, return the last
-          sampled runner instead of looping forever
+        Uses pre-built CPLEX models (Fix 3): runner.reset_state() re-solves the
+        initial LP without rebuilding the model, so this is fast.
+
+        Fallback behaviour
+        ------------------
+        If no instance reaches a usable decision point after max_reset_resamples
+        attempts, a ValueError is raised rather than silently returning a runner
+        in a done/failed state (which would give the agent a zero-length episode
+        and waste training timesteps).
         """
-        last_problem = None
-        last_runner = None
+        last_problem: Optional[ProblemInstance] = None
+        last_runner: Optional[FeasibilityPumpCore] = None
 
         for attempt in range(self.config.max_reset_resamples):
-            instance_path = (
-                requested_path
-                if (attempt == 0 and requested_path is not None)
-                else self._sample_instance_path()
+            # Pick from cache
+            if attempt == 0 and requested_path is not None:
+                matches = [
+                    i for i, (p, _) in enumerate(self._instance_cache)
+                    if p.instance_path == requested_path
+                ]
+                idx = matches[0] if matches else self._sample_cache_index()
+            else:
+                idx = self._sample_cache_index()
+
+            problem, runner = self._instance_cache[idx]
+
+            logger.debug(
+                "[reset] attempt=%d/%d  instance=%s",
+                attempt + 1, self.config.max_reset_resamples, problem.instance_path,
             )
 
-            print(f"[reset] attempt={attempt + 1} instance={instance_path}", flush=True)
+            # Fast state reset — reuses pre-built CPLEX models
+            runner.reset_state()
 
-            problem = load_npz_instance(instance_path)
-            runner = FeasibilityPumpCore(problem, self.config.fp_config)
-            runner.reset()
-
-            print(
-                f"[reset] after runner.reset(): "
-                f"failed={runner.failed}, "
-                f"done={runner.done}, "
-                f"terminated_in_initial_relaxation={runner.terminated_in_initial_relaxation}, "
-                f"initial_lp_solve_s={getattr(runner, 'initial_lp_solve_seconds', 0.0):.2f}, "
-                f"reset_s={getattr(runner, 'reset_seconds', 0.0):.2f}",
-                flush=True,
+            logger.debug(
+                "[reset] after reset_state: failed=%s done=%s "
+                "trivial=%s lp_solve=%.2fs",
+                runner.failed, runner.done,
+                runner.terminated_in_initial_relaxation,
+                runner.initial_lp_solve_seconds,
             )
 
             last_problem = problem
             last_runner = runner
 
-            # Skip instances that fail before FP can even start
             if runner.failed:
-                print("[reset] skipping instance: reset failed", flush=True)
+                logger.debug("[reset] skipping: reset_state failed")
                 continue
 
-            # Skip instances solved immediately in the initial LP relaxation
             if runner.terminated_in_initial_relaxation:
-                print("[reset] skipping instance: solved in initial relaxation", flush=True)
+                logger.debug("[reset] skipping: solved in initial relaxation")
                 continue
 
-            # Advance naturally until first decision point or termination
+            # Advance naturally to the first decision point
             if not runner.done:
-                print("[reset] advancing until first decision point or done...", flush=True)
                 runner.advance_until_stall_or_done()
-                print(
-                    f"[reset] after natural advance: "
-                    f"done={runner.done}, "
-                    f"failed={runner.failed}, "
-                    f"stalled={runner.is_stalled()}, "
-                    f"iterations={runner.iteration}, "
-                    f"distance={runner.current_distance():.4f}",
-                    flush=True,
+                logger.debug(
+                    "[reset] after natural advance: done=%s stalled=%s "
+                    "iters=%d dist=%.4f",
+                    runner.done, runner.is_stalled(),
+                    runner.iteration, runner.current_distance(),
                 )
 
-            # Accept only when the agent can really act next
             if (not runner.done) and (not runner.failed) and runner.is_stalled():
-                print("[reset] accepted instance: decision point reached", flush=True)
+                logger.debug("[reset] accepted: decision point reached")
                 return problem, runner
 
-            print("[reset] rejected instance: no usable RL decision point", flush=True)
+            logger.debug("[reset] rejected: no usable RL decision point")
 
-        # Fallback: return the last sampled runner even if not ideal.
-        # This prevents infinite reset loops when the pool is mostly trivial
-        # or mostly early-failing.
-        print("[reset] fallback: returning last sampled runner", flush=True)
+        # Fallback: use the last sampled runner rather than looping forever.
+        # Log a warning so the user knows the pool quality is poor.
+        logger.warning(
+            "[reset] all %d resamples exhausted without finding a usable "
+            "decision point.  Returning last runner (may be in done/failed "
+            "state).  Consider screening the instance pool.",
+            self.config.max_reset_resamples,
+        )
         return last_problem, last_runner
 
     # -------------------------------------------------------------------------
@@ -316,10 +351,11 @@ class FeasibilityPumpRLEnv(gym.Env):
         dist_improve = self.prev_dist_delta / n_integer
         dist_improve = float(np.clip(dist_improve, -1.0, 1.0))
 
-        stall_ratio = min(
-            1.0,
-            self.runner.consecutive_no_change / max(1, self.runner.config.stall_threshold),
-        )
+        # Binary flag: is FP currently at a decision point (stalled)?
+        # With the 1-event stall semantics, consecutive_no_change is 0 or 1,
+        # so this is more informative than dividing by stall_threshold.
+        at_decision_point = 1.0 if self.runner.is_stalled() else 0.0
+
         iter_ratio = min(
             1.0,
             self.runner.iteration / max(1, self.runner.config.max_iterations),
@@ -333,7 +369,9 @@ class FeasibilityPumpRLEnv(gym.Env):
         )
 
         last_flip_ratio = min(1.0, self.runner.last_k / n_integer)
-        current_cycle_flag = 1.0 if self.runner.consecutive_no_change >= 2 * max(1, self.runner.config.stall_threshold) else 0.0
+        # How many stall events have accumulated relative to the budget?
+        # Replaces current_cycle_flag which could never be True with 1-event stalls.
+        stall_event_ratio = min(1.0, self.runner.stall_events / max(1, self.runner.config.max_stalls))
         feasible_found_flag = 1.0 if self.runner.integer_found else 0.0
 
         # Use the runner's recent distance deltas as a compact progress signal
@@ -350,18 +388,18 @@ class FeasibilityPumpRLEnv(gym.Env):
 
         progress = np.array(
             [
-                current_distance_norm,     # 0
-                best_distance_norm,        # 1
-                dist_improve,              # 2
-                stall_ratio,               # 3
-                iter_ratio,                # 4
-                elapsed_ratio,             # 5
-                remaining_ratio,           # 6
-                last_flip_ratio,           # 7
-                current_cycle_flag,        # 8
-                feasible_found_flag,       # 9
-                recent_delta,              # 10
-                objective_degradation_from_lp,  # 11
+                current_distance_norm,          # 0  current dist / n_int
+                best_distance_norm,             # 1  best dist / n_int
+                dist_improve,                   # 2  improvement this step
+                at_decision_point,              # 3  1 = stalled, 0 = running  (Fix 2)
+                iter_ratio,                     # 4  iterations used
+                elapsed_ratio,                  # 5  time used
+                remaining_ratio,                # 6  time remaining
+                last_flip_ratio,                # 7  flip size / n_int
+                stall_event_ratio,              # 8  stall count / max_stalls  (Fix 2)
+                feasible_found_flag,            # 9  1 = integer solution found
+                recent_delta,                   # 10 mean recent dist delta
+                objective_degradation_from_lp,  # 11 LP obj degradation
             ],
             dtype=np.float32,
         )
@@ -496,7 +534,10 @@ class FeasibilityPumpRLEnv(gym.Env):
         r_frac = self.config.reward_frac_improve * float(delta)
         r_best = self.config.reward_best_improve * float(best_gain)
         r_feas = self.config.reward_feasible_bonus if feasible_found else 0.0
-        r_time = -self.config.reward_time_penalty * step_runtime
+        # Normalize by time_limit so the penalty scale is instance-size-independent (Fix 5)
+        r_time = -self.config.reward_time_penalty * (
+            step_runtime / max(1e-8, self.runner.config.time_limit)
+        )
         r_flip = -self.config.reward_flip_penalty * (flip_count / n_integer)
         r_stall = -self.config.reward_stall_penalty if still_stalled else 0.0
 
@@ -557,7 +598,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.best_distance = self.runner.current_distance()
 
         observation = self._build_observation()
-        print(f"[reset] sampling instance: {self.problem.instance_path}", flush=True)
+        logger.debug("[reset] episode=%d  instance=%s", self.episode_id, self.problem.instance_path)
         info = {
             "episode_id": self.episode_id,
             "instance_path": self.problem.instance_path if self.problem is not None else None,
@@ -615,7 +656,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         n_integer = max(1, len(self.problem.integer_indices))
         flip_count = flip_bin_to_count(flip_bin, n_integer)
 
-        continuation_mult = CONTINUATION_MULTIPLIERS[cont_bin]
+        continuation_max_steps = CONTINUATION_MAX_STEPS[cont_bin]
         continuation_label = CONTINUATION_LABELS[cont_bin]
 
         # Save state before acting
@@ -637,18 +678,13 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.cumulative_flips += flip_count
 
         # ---------------------------------------------------------------------
-        # 3. Temporarily modify patience for the next natural FP window
+        # 3. Advance FP naturally for up to continuation_max_steps iterations
+        #    before returning control to the agent (Fix 1).
+        #    This makes the continuation action genuinely affect behaviour:
+        #    the agent decides how long FP runs between interventions.
         # ---------------------------------------------------------------------
-        original_threshold = self.runner.config.stall_threshold
-        local_threshold = max(1, int(round(original_threshold * continuation_mult)))
-        self.runner.config.stall_threshold = local_threshold
-
-        try:
-            if not self.runner.done:
-                self.runner.advance_until_stall_or_done()
-        finally:
-            # Always restore the original threshold
-            self.runner.config.stall_threshold = original_threshold
+        if not self.runner.done:
+            self.runner.advance_until_stall_or_done(max_steps=continuation_max_steps)
 
         # ---------------------------------------------------------------------
         # 4. Collect new state
@@ -731,7 +767,7 @@ class FeasibilityPumpRLEnv(gym.Env):
             "flip_bin": flip_bin,
             "flip_count": flip_count,
             "continuation_bin": cont_bin,
-            "continuation_mult": continuation_mult,
+            "continuation_max_steps": continuation_max_steps,
             "continuation_label": continuation_label,
 
             "iterations": self.runner.iteration,
