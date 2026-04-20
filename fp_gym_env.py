@@ -799,11 +799,4 @@ class FeasibilityPumpRLEnv(gym.Env):
             "termination_reason": self.termination_reason,
         }
 
-        return observation, float(reward), terminated, truncated, infoaining_time() or 0.0),
-
-            "terminated": terminated,
-            "truncated": truncated,
-            "termination_reason": self.termination_reason,
-        }
-
         return observation, float(reward), terminated, truncated, info

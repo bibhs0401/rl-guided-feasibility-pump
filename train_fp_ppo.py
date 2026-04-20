@@ -556,39 +556,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-.total_timesteps, callback=callback)
-
-    # ── save final model (name includes shape + timestamp) ───────────────
-    final_model = str(run_dir / f"{args.save_name}_{shape_tag}_{timestamp}")
-    print(f"[info] saving model -> {final_model}.zip", flush=True)
-    model.save(final_model)
-
-    vec_env.close()
-    print("[info] training complete", flush=True)
-    print(f"[info] csv log    : {csv_log_path}", flush=True)
-    if log_file:
-        print(f"[info] stdout log : {log_file}", flush=True)
-    if _tee is not None:
-        _tee.close()
-
-
-if __name__ == "__main__":
-    main()
-otal_timesteps=args.total_timesteps, callback=callback)
-
-    # ── save final model (name includes shape + timestamp) ───────────────
-    final_model = str(run_dir / f"{args.save_name}_{shape_tag}_{timestamp}")
-    print(f"[info] saving model -> {final_model}.zip", flush=True)
-    model.save(final_model)
-
-    vec_env.close()
-    print("[info] training complete", flush=True)
-    print(f"[info] csv log    : {csv_log_path}", flush=True)
-    if log_file:
-        print(f"[info] stdout log : {log_file}", flush=True)
-    if _tee is not None:
-        _tee.close()
-
-
-if __name__ == "__main__":
-    main()
