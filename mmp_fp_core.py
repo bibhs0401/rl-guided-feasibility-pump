@@ -497,6 +497,17 @@ def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: Optional[f
     if not ok:
         return None
 
+    if max_seconds is not None:
+        status = str(getattr(model.solve_details, "status", "")).lower()
+        if "optimal" not in status:
+            logger.warning(
+                "Initial LP relaxation stopped without proven optimality "
+                "(status=%s, limit=%.2fs). Marking instance as failed.",
+                getattr(model.solve_details, "status", "unknown"),
+                float(max_seconds),
+            )
+            return None
+
     x_values = [float(v.solution_value) for v in x_vars]
     y_values = [float(v.solution_value) for v in y_vars]
     obj = float(model.objective_value)
@@ -760,7 +771,7 @@ class FeasibilityPumpCore:
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=None,  # no cap: solve to completion once
+            max_seconds=self.config.initial_lp_time_limit,
         )
         self.initial_lp_solve_seconds = time.time() - lp_started
         # Store as a tuple (x_relaxed, y_values, lp_obj) or None if infeasible.
@@ -910,7 +921,7 @@ class FeasibilityPumpCore:
             return False
 
         num_flips = len(flip_indices)
-        prev_stalled = self.is_stalled()
+        prev_stalled = self.is_stalle d()
 
         # Apply perturbation to the rounded point if requested
         if flip_indices:

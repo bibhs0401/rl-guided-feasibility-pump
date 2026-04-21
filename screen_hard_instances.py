@@ -183,6 +183,7 @@ def main():
             f"integer_found={summary['integer_found']} "
             f"failed={summary['failed']} "
             f"init_relax={summary['terminated_in_initial_relaxation']} "
+            f"init_lp={summary['initial_lp_solve_seconds']:.2f}s "
             f"iters={summary['iterations']} "
             f"stalls={summary['stall_events']} "
             f"time={summary['elapsed_seconds']:.2f}s "
