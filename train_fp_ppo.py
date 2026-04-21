@@ -360,6 +360,15 @@ def main():
         "--instance-list", required=True,
         help="Text file with one .npz path per line.",
     )
+    parser.add_argument(
+        "--pool-size", type=int, default=0,
+        help=(
+            "Limit the training pool to this many instances (0 = use all). "
+            "Instances are taken from the top of the list as-is. "
+            "Useful to start training immediately with a small set while the "
+            "rest of the LP caches are being built on subsequent runs."
+        ),
+    )
 
     # Run / output
     parser.add_argument("--run-dir",   default="runs/fp_ppo_step3")
@@ -416,6 +425,9 @@ def main():
 
     # ── paths ────────────────────────────────────────────────────────────
     instance_paths = read_instance_list(args.instance_list)
+    if args.pool_size and args.pool_size < len(instance_paths):
+        instance_paths = instance_paths[: args.pool_size]
+        print(f"[info] pool-size cap applied — using {len(instance_paths)} instances", flush=True)
 
     run_dir = Path(args.run_dir) / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)

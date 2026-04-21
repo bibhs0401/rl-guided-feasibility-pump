@@ -211,40 +211,67 @@ class FeasibilityPumpRLEnv(gym.Env):
         self.consecutive_non_improving = 0
 
         # ---------------------------------------------------------------------
-        # Pre-build CPLEX models for every instance in the pool (Fix 3).
-        # build_models() is slow but only runs once per instance at startup.
-        # Each episode calls runner.reset_state() which reuses these models,
-        # eliminating the per-episode rebuild cost.
+        # Lazy model cache — CPLEX models are built on first access, not upfront.
+        #
+        # _instance_paths  : ordered list of .npz paths from config
+        # _instance_cache  : parallel list; None until the slot is first used,
+        #                    then (ProblemInstance, FeasibilityPumpCore)
+        # _n_built         : counter for logging
+        #
+        # Why lazy?  For large instances (m=9000, n=3000) each build_models()
+        # call takes 2-5s for model construction plus up to initial_lp_time_limit
+        # seconds for the LP solve.  Building all 114 instances upfront before
+        # PPO even starts wastes hours of wall time on instances that may never
+        # be reached in a short training run.  Lazy init spreads that cost
+        # across training and the disk LP cache makes subsequent restarts free.
         # ---------------------------------------------------------------------
+        self._instance_paths: List[str] = list(config.instance_paths)
+        self._instance_cache: List[Optional[tuple]] = [None] * len(self._instance_paths)
+        self._n_built: int = 0
         logger.info(
-            "[init] pre-building CPLEX models for %d instances …",
-            len(config.instance_paths),
+            "[init] lazy mode — %d instances registered; CPLEX models built on first use",
+            len(self._instance_paths),
         )
-        self._instance_cache: List[tuple] = []
-        for i, path in enumerate(config.instance_paths):
-            problem = load_npz_instance(path)
-            runner = FeasibilityPumpCore(problem, self.config.fp_config)
-            runner.build_models()
-            self._instance_cache.append((problem, runner))
-            lp_ok = runner._cached_lp_result is not None
-            logger.info(
-                "[init] built %d/%d  %s  (relax=%.1fs  dist=%.1fs  lp=%.1fs  lp_ok=%s)",
-                i + 1, len(config.instance_paths), Path(path).name,
-                runner.relaxation_build_seconds, runner.distance_build_seconds,
-                runner.initial_lp_solve_seconds, lp_ok,
-            )
-        n_ok = sum(1 for _, r in self._instance_cache if r._cached_lp_result is not None)
+
+    # -------------------------------------------------------------------------
+    # Lazy build helper
+    # -------------------------------------------------------------------------
+    def _ensure_built(self, idx: int) -> tuple:
+        """
+        Return (ProblemInstance, FeasibilityPumpCore) for slot idx,
+        building and caching on first access.
+
+        After build_models() the disk LP cache is populated so that
+        subsequent process restarts skip the LP solve entirely.
+        """
+        if self._instance_cache[idx] is not None:
+            return self._instance_cache[idx]
+
+        path = self._instance_paths[idx]
+        problem = load_npz_instance(path)
+        runner = FeasibilityPumpCore(problem, self.config.fp_config)
+        runner.build_models()
+
+        self._instance_cache[idx] = (problem, runner)
+        self._n_built += 1
+
+        lp_ok = runner._cached_lp_result is not None
         logger.info(
-            "[init] all models built — %d/%d instances have a valid cached LP solution",
-            n_ok, len(config.instance_paths),
+            "[build %d/%d]  %s  (relax=%.1fs  dist=%.1fs  lp=%.1fs  lp_ok=%s)",
+            self._n_built, len(self._instance_paths), Path(path).name,
+            runner.relaxation_build_seconds,
+            runner.distance_build_seconds,
+            runner.initial_lp_solve_seconds,
+            lp_ok,
         )
+        return self._instance_cache[idx]
 
     # -------------------------------------------------------------------------
     # Reset helpers
     # -------------------------------------------------------------------------
     def _sample_cache_index(self) -> int:
-        """Randomly sample one index from the pre-built instance cache."""
-        return int(self.rng.integers(0, len(self._instance_cache)))
+        """Randomly sample one index from the instance pool."""
+        return int(self.rng.integers(0, len(self._instance_paths)))
 
     def _load_nontrivial_instance(
         self,
@@ -268,17 +295,18 @@ class FeasibilityPumpRLEnv(gym.Env):
         last_runner: Optional[FeasibilityPumpCore] = None
 
         for attempt in range(self.config.max_reset_resamples):
-            # Pick from cache
+            # Pick index — honour a specific path on the first attempt if given
             if attempt == 0 and requested_path is not None:
                 matches = [
-                    i for i, (p, _) in enumerate(self._instance_cache)
-                    if p.instance_path == requested_path
+                    i for i, p in enumerate(self._instance_paths)
+                    if p == requested_path
                 ]
                 idx = matches[0] if matches else self._sample_cache_index()
             else:
                 idx = self._sample_cache_index()
 
-            problem, runner = self._instance_cache[idx]
+            # Build model on first access (no-op if already built)
+            problem, runner = self._ensure_built(idx)
 
             logger.info(
                 "[reset ep=%d] attempt=%d/%d  instance=%s  (resetting LP …)",
