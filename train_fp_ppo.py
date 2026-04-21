@@ -121,6 +121,19 @@ _CSV_FIELDS = [
 ]
 
 
+# Per-episode CSV — one row per finished training episode (no rolling averaging).
+# Useful for fine-grained training curves and for auditing individual instances.
+_PER_EP_CSV_FIELDS = [
+    "episode", "timesteps", "wall_time",
+    "instance_name", "m", "n", "p",
+    "reward", "feasible", "failed", "termination_reason",
+    "iterations", "stall_events", "total_flips",
+    "initial_distance", "final_distance", "best_distance",
+    "fp_time_s", "initial_lp_solve_seconds", "reset_seconds",
+    "r_frac", "r_best", "r_feas", "r_time", "r_flip", "r_stall",
+]
+
+
 # ---------------------------------------------------------------------------
 # Training callback
 # ---------------------------------------------------------------------------
@@ -146,6 +159,7 @@ class PPOTrainingLogger(BaseCallback):
         checkpoint_every: int = 0,
         checkpoint_dir: str = "",
         csv_log_path: str = "",
+        per_episode_csv_path: str = "",
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -159,6 +173,10 @@ class PPOTrainingLogger(BaseCallback):
         self._csv_path = csv_log_path
         self._csv_file = None
         self._csv_writer = None
+
+        self._per_ep_csv_path = per_episode_csv_path
+        self._per_ep_csv_file = None
+        self._per_ep_csv_writer = None
 
         self.episode_count = 0
 
@@ -264,6 +282,15 @@ class PPOTrainingLogger(BaseCallback):
             self._csv_writer = _csv.DictWriter(self._csv_file, fieldnames=_CSV_FIELDS)
             self._csv_writer.writeheader()
             self._csv_file.flush()
+        if self._per_ep_csv_path:
+            self._per_ep_csv_file = open(
+                self._per_ep_csv_path, "w", newline="", encoding="utf-8"
+            )
+            self._per_ep_csv_writer = _csv.DictWriter(
+                self._per_ep_csv_file, fieldnames=_PER_EP_CSV_FIELDS
+            )
+            self._per_ep_csv_writer.writeheader()
+            self._per_ep_csv_file.flush()
 
     def _on_training_end(self) -> None:
         if self.episode_count > self._last_logged_episode:
@@ -273,6 +300,11 @@ class PPOTrainingLogger(BaseCallback):
             self._csv_file.close()
         self._csv_file = None
         self._csv_writer = None
+        if self._per_ep_csv_file is not None:
+            self._per_ep_csv_file.flush()
+            self._per_ep_csv_file.close()
+        self._per_ep_csv_file = None
+        self._per_ep_csv_writer = None
         super()._on_training_end()
 
     # ------------------------------------------------------------------
@@ -341,6 +373,42 @@ class PPOTrainingLogger(BaseCallback):
             self._last_m = int(info.get("m", 0))
             self._last_n = int(info.get("n", 0))
             self._last_p = int(info.get("p", 0))
+
+            # ── per-episode CSV row ───────────────────────────────────
+            if self._per_ep_csv_writer is not None:
+                self._per_ep_csv_writer.writerow({
+                    "episode":            self.episode_count,
+                    "timesteps":          self.num_timesteps,
+                    "wall_time":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "instance_name":      str(info.get("instance_name", "")),
+                    "m":                  self._last_m,
+                    "n":                  self._last_n,
+                    "p":                  self._last_p,
+                    "reward":             round(ep_reward, 6),
+                    "feasible":           feasible,
+                    "failed":             failed,
+                    "termination_reason": term_reason,
+                    "iterations":         iterations,
+                    "stall_events":       stall_events,
+                    "total_flips":        total_flips,
+                    "initial_distance":   round(float(info.get("initial_distance", 0.0) or 0.0), 6),
+                    "final_distance":     round(final_dist, 6),
+                    "best_distance":      round(best_dist, 6),
+                    "fp_time_s":          round(fp_time, 3),
+                    "initial_lp_solve_seconds": round(
+                        float(info.get("initial_lp_solve_seconds", 0.0) or 0.0), 3
+                    ),
+                    "reset_seconds":      round(
+                        float(info.get("reset_seconds", 0.0) or 0.0), 3
+                    ),
+                    "r_frac":             round(acc.get("r_frac", 0.0), 6),
+                    "r_best":             round(acc.get("r_best", 0.0), 6),
+                    "r_feas":             round(acc.get("r_feas", 0.0), 6),
+                    "r_time":             round(acc.get("r_time", 0.0), 6),
+                    "r_flip":             round(acc.get("r_flip", 0.0), 6),
+                    "r_stall":            round(acc.get("r_stall", 0.0), 6),
+                })
+                self._per_ep_csv_file.flush()
 
             # ── print + CSV every N episodes ───────────────────────────
             if self.episode_count % self.print_every_episodes == 0:
@@ -473,6 +541,7 @@ def main():
     shape_tag = f"p{_p}_m{_m}_n{_n}"
 
     csv_log_path = str(run_dir / f"training_log_{shape_tag}_{timestamp}.csv")
+    per_ep_csv_path = str(run_dir / f"training_episodes_{shape_tag}_{timestamp}.csv")
 
     # ── stdout tee ───────────────────────────────────────────────────────
     if args.log_file:
@@ -493,6 +562,7 @@ def main():
         "shape_tag":       shape_tag,
         "timestamp":       timestamp,
         "csv_log_path":    csv_log_path,
+        "per_ep_csv_path": per_ep_csv_path,
     })
     with open(run_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)
@@ -563,6 +633,7 @@ def main():
             checkpoint_every=args.checkpoint_every,
             checkpoint_dir=checkpoint_dir,
             csv_log_path=csv_log_path,
+            per_episode_csv_path=per_ep_csv_path,
             verbose=0,
         )
     ])
@@ -579,6 +650,7 @@ def main():
     vec_env.close()
     print("[info] training complete", flush=True)
     print(f"[info] csv log    : {csv_log_path}", flush=True)
+    print(f"[info] per-ep csv : {per_ep_csv_path}", flush=True)
     if log_file:
         print(f"[info] stdout log : {log_file}", flush=True)
     if _tee is not None:
