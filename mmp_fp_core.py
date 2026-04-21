@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Standard library imports
 import logging
+import pickle
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -763,19 +764,55 @@ class FeasibilityPumpCore:
         # Solve the initial LP once and cache the result.
         # reset_state() copies from this cache instead of re-solving.
         #
-        # No time limit here — this is a one-time startup cost and we must
-        # let it run to completion. The initial_lp_time_limit in FPRunConfig
-        # was designed for per-episode resets, which no longer re-solve the LP.
+        # Disk cache: on first run the solution is written to a .pkl file next
+        # to the .npz instance so that subsequent process restarts skip the
+        # (potentially multi-minute) LP solve entirely.
+        #
+        # Cache filename encodes dimensions so different-sized instances never
+        # collide: <stem>_m<m>_n<n>.lp_cache.pkl
+        inst_path = Path(self.problem.instance_path)
+        lp_cache_path = inst_path.parent / (
+            f"{inst_path.stem}_m{self.problem.m}_n{self.problem.n}.lp_cache.pkl"
+        )
+
+        if lp_cache_path.exists():
+            try:
+                with open(lp_cache_path, "rb") as _f:
+                    lp_result = pickle.load(_f)
+                self.initial_lp_solve_seconds = 0.0
+                self._cached_lp_result = lp_result
+                logger.info(
+                    "LP cache hit  — loaded %s (skipped solve)", lp_cache_path.name
+                )
+                return
+            except Exception as _e:
+                logger.warning(
+                    "LP cache file %s unreadable (%s) — re-solving.",
+                    lp_cache_path.name, _e,
+                )
+
         lp_started = time.time()
         lp_result = solve_relaxation_model(
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=self.config.initial_lp_time_limit,
+            max_seconds=None,  # no cap — solve to proven optimality once
         )
         self.initial_lp_solve_seconds = time.time() - lp_started
         # Store as a tuple (x_relaxed, y_values, lp_obj) or None if infeasible.
         self._cached_lp_result = lp_result
+
+        if lp_result is not None:
+            try:
+                with open(lp_cache_path, "wb") as _f:
+                    pickle.dump(lp_result, _f)
+                logger.info(
+                    "LP cache saved — %s (%.1f KB)",
+                    lp_cache_path.name,
+                    lp_cache_path.stat().st_size / 1024,
+                )
+            except Exception as _e:
+                logger.warning("Could not write LP cache %s: %s", lp_cache_path.name, _e)
 
     def reset_state(self) -> None:
         """
