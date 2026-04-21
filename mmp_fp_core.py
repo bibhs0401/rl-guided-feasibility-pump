@@ -115,9 +115,11 @@ class FPRunConfig:
         in main_phase1.py.
 
     initial_lp_time_limit:
-        Separate protective cap for the initial LP relaxation solve.
-        This is an engineering safeguard so reset() does not hang for a very
-        long time on difficult instances.
+        Wall-clock cap in seconds for the initial LP relaxation solve in
+        build_models().  CPLEX may stop early with a feasible solution that is
+        not proven optimal — sufficient as an FP starting point.  Use None to
+        disable the cap and let the solver run to optimality (slow on large
+        instances).
     """
     max_iterations: int = 100
     time_limit: float = 30.0
@@ -126,6 +128,37 @@ class FPRunConfig:
     max_stalls: int = 50
     recent_delta_window: int = 5
     cplex_threads: int = 1
+
+
+def _initial_lp_cache_tag(initial_lp_time_limit: float | None) -> str:
+    """
+    Build a short, filesystem-safe token for disk LP caches.
+
+    Distinguishes optimal (no limit) vs time-capped initial solves so cache
+    files do not collide when initial_lp_time_limit changes.
+    """
+    if initial_lp_time_limit is None:
+        return "ilp_opt"
+    s = f"{float(initial_lp_time_limit):g}".replace(".", "p").replace("-", "m")
+    return f"ilp_t{s}"
+
+
+def initial_lp_disk_cache_path(
+    instance_path: str | Path,
+    m: int,
+    n: int,
+    initial_lp_time_limit: float | None,
+) -> Path:
+    """Path for the pickled initial-LP solution next to the instance .npz."""
+    inst_path = Path(instance_path)
+    tag = _initial_lp_cache_tag(initial_lp_time_limit)
+    return inst_path.parent / f"{inst_path.stem}_m{m}_n{n}_{tag}.lp_cache.pkl"
+
+
+def _legacy_lp_disk_cache_path(instance_path: str | Path, m: int, n: int) -> Path:
+    """Pre-tag cache filename (same instance may have been cached before tags)."""
+    inst_path = Path(instance_path)
+    return inst_path.parent / f"{inst_path.stem}_m{m}_n{n}.lp_cache.pkl"
 
 
 # -----------------------------------------------------------------------------
@@ -500,12 +533,12 @@ def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: Optional[f
     close the optimality gap, so requiring "optimal" status would force an
     unbounded solve even though the FP starting point is already good enough.
     """
-    ok = solve_with_time_limit(model, max_seconds)
-    if not ok:
-        return None
+    # Note: solve() may return None when CPLEX stops at a time limit even though
+    # a feasible LP basis exists on the model.  We therefore do NOT early-return
+    # on a falsy solve() result; instead, we check model.solution directly so
+    # time-limited feasible solutions are accepted as the FP starting point.
+    solve_with_time_limit(model, max_seconds)
 
-    # Accept any status where CPLEX actually produced a solution (optimal OR
-    # time-limited feasible).  Reject only if truly no solution exists.
     if model.solution is None:
         status = str(getattr(model.solve_details, "status", "unknown"))
         logger.warning(
@@ -519,10 +552,10 @@ def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: Optional[f
     status = str(getattr(model.solve_details, "status", "")).lower()
     if "optimal" not in status:
         logger.info(
-            "Initial LP relaxation stopped at time limit with feasible solution "
-            "(status=%s, limit=%.2fs). Using feasible point as FP start.",
+            "Initial LP relaxation stopped before proven optimality with a feasible "
+            "solution (status=%s, limit=%s). Using feasible point as FP start.",
             getattr(model.solve_details, "status", "unknown"),
-            float(max_seconds) if max_seconds is not None else 0.0,
+            f"{float(max_seconds):.2f}s" if max_seconds is not None else "none",
         )
 
     x_values = [float(v.solution_value) for v in x_vars]
@@ -759,9 +792,12 @@ class FeasibilityPumpCore:
         reuse the models (and the cached LP solution) across all episodes
         via reset_state().
 
+        The initial relaxation uses config.initial_lp_time_limit (None =
+        optimality).  A feasible starting point suffices for FP; a time cap
+        avoids spending minutes proving LP optimality on huge instances.
+
         The initial LP solution is cached so that reset_state() can restore
-        it instantly without re-solving — critical for large instances where
-        the LP solve itself takes minutes.
+        it instantly without re-solving.
         """
         build_started = time.time()
         self.relaxation_model, self.relaxation_x, self.relaxation_y = build_relaxation_model(
@@ -782,29 +818,37 @@ class FeasibilityPumpCore:
         #
         # Disk cache: on first run the solution is written to a .pkl file next
         # to the .npz instance so that subsequent process restarts skip the
-        # (potentially multi-minute) LP solve entirely.
-        #
-        # Cache filename encodes dimensions so different-sized instances never
-        # collide: <stem>_m<m>_n<n>.lp_cache.pkl
+        # LP solve entirely.  Filename includes initial_lp_time_limit so
+        # optimal vs time-capped caches do not collide.
         inst_path = Path(self.problem.instance_path)
-        lp_cache_path = inst_path.parent / (
-            f"{inst_path.stem}_m{self.problem.m}_n{self.problem.n}.lp_cache.pkl"
+        lp_cache_path = initial_lp_disk_cache_path(
+            self.problem.instance_path,
+            self.problem.m,
+            self.problem.n,
+            self.config.initial_lp_time_limit,
+        )
+        legacy_cache_path = _legacy_lp_disk_cache_path(
+            self.problem.instance_path,
+            self.problem.m,
+            self.problem.n,
         )
 
-        if lp_cache_path.exists():
+        for candidate_path in (lp_cache_path, legacy_cache_path):
+            if not candidate_path.exists():
+                continue
             try:
-                with open(lp_cache_path, "rb") as _f:
+                with open(candidate_path, "rb") as _f:
                     lp_result = pickle.load(_f)
                 self.initial_lp_solve_seconds = 0.0
                 self._cached_lp_result = lp_result
                 logger.info(
-                    "LP cache hit  — loaded %s (skipped solve)", lp_cache_path.name
+                    "LP cache hit  — loaded %s (skipped solve)", candidate_path.name
                 )
                 return
             except Exception as _e:
                 logger.warning(
-                    "LP cache file %s unreadable (%s) — re-solving.",
-                    lp_cache_path.name, _e,
+                    "LP cache file %s unreadable (%s) — trying next / re-solving.",
+                    candidate_path.name, _e,
                 )
 
         lp_started = time.time()
@@ -812,8 +856,6 @@ class FeasibilityPumpCore:
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            # Respect the configured time limit but accept any feasible solution
-            # (not just proven-optimal) — see solve_relaxation_model docstring.
             max_seconds=self.config.initial_lp_time_limit,
         )
         self.initial_lp_solve_seconds = time.time() - lp_started
@@ -834,7 +876,7 @@ class FeasibilityPumpCore:
 
     def reset_state(self) -> None:
         """
-        Reset all FP episode state and solve the initial LP relaxation.
+        Reset all FP episode state and restore the cached initial LP solution.
 
         Assumes build_models() has already been called.  Does NOT rebuild
         the CPLEX models, so it is fast enough to call at the start of
@@ -842,8 +884,8 @@ class FeasibilityPumpCore:
 
         Baseline-matching behavior
         --------------------------
-        The initial LP is solved BEFORE the FP-loop timer starts, matching
-        the semantics of main_phase1.py.
+        The initial LP is obtained in build_models() before the FP-loop timer
+        starts, matching the semantics of main_phase1.py.
         """
         reset_started = time.time()
 
@@ -1209,7 +1251,16 @@ if __name__ == "__main__":
         "--initial-lp-time-limit",
         type=float,
         default=200.0,
-        help="Separate time limit in seconds for the initial LP relaxation solve.",
+        help=(
+            "Wall-clock cap (seconds) for the initial LP relaxation in build_models. "
+            "Feasible solution may be non-optimal; enough for FP. "
+            "Ignored if --initial-lp-optimal is set."
+        ),
+    )
+    parser.add_argument(
+        "--initial-lp-optimal",
+        action="store_true",
+        help="Solve the initial LP to optimality (no time limit); slow on large instances.",
     )
     args = parser.parse_args()
 
@@ -1218,13 +1269,15 @@ if __name__ == "__main__":
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    initial_lp_limit = None if args.initial_lp_optimal else args.initial_lp_time_limit
+
     cfg = FPRunConfig(
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,
-        initial_lp_time_limit=args.initial_lp_time_limit,
+        initial_lp_time_limit=initial_lp_limit,
     )
 
     summary = run_single_fp_episode(args.instance, cfg)

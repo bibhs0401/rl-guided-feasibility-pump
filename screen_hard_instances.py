@@ -127,7 +127,15 @@ def main():
         "--initial-lp-time-limit",
         type=float,
         default=200.0,
-        help="Time limit in seconds for initial LP solve per instance.",
+        help=(
+            "Wall-clock cap (seconds) for the initial LP in build_models (feasible, "
+            "not necessarily optimal). Ignored if --initial-lp-optimal is set."
+        ),
+    )
+    parser.add_argument(
+        "--initial-lp-optimal",
+        action="store_true",
+        help="Solve the initial LP to optimality (no time limit); slow on large instances.",
     )
     parser.add_argument(
         "--log-level",
@@ -137,6 +145,8 @@ def main():
     )
     parser.add_argument("--seed-tag", default="seed10", help="Tag to include in output filenames.")
     args = parser.parse_args()
+
+    initial_lp_limit = None if args.initial_lp_optimal else args.initial_lp_time_limit
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
@@ -156,7 +166,7 @@ def main():
     fp_cfg = FPRunConfig(
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
-        initial_lp_time_limit=args.initial_lp_time_limit,
+        initial_lp_time_limit=initial_lp_limit,
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,
@@ -258,6 +268,8 @@ def main():
             "instances_glob": args.instances,
             "time_limit": args.time_limit,
             "initial_lp_time_limit": args.initial_lp_time_limit,
+            "initial_lp_optimal": args.initial_lp_optimal,
+            "initial_lp_time_limit_resolved": initial_lp_limit,
             "max_iterations": args.max_iterations,
             "stall_threshold": args.stall_threshold,
             "max_stalls": args.max_stalls,

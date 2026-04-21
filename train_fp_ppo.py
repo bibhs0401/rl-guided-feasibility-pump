@@ -74,7 +74,7 @@ def make_env_fn(
     seed: int,
     max_iterations: int,
     time_limit: float,
-    initial_lp_time_limit: float,
+    initial_lp_time_limit: float | None,
     stall_threshold: int,
     max_stalls: int,
     cplex_threads: int,
@@ -382,7 +382,15 @@ def main():
         "--initial-lp-time-limit",
         type=float,
         default=200.0,
-        help="Time limit in seconds for the initial LP relaxation solve during reset.",
+        help=(
+            "Wall-clock cap (seconds) for the initial LP in build_models (feasible, "
+            "not necessarily optimal). Ignored if --initial-lp-optimal is set."
+        ),
+    )
+    parser.add_argument(
+        "--initial-lp-optimal",
+        action="store_true",
+        help="Solve the initial LP to optimality (no time limit); slow on large instances.",
     )
     parser.add_argument("--stall-threshold",    type=int,   default=3)
     parser.add_argument("--max-stalls",         type=int,   default=50)
@@ -422,6 +430,8 @@ def main():
                              "when --tensorboard is set).")
 
     args = parser.parse_args()
+
+    initial_lp_limit = None if args.initial_lp_optimal else args.initial_lp_time_limit
 
     # ── paths ────────────────────────────────────────────────────────────
     instance_paths = read_instance_list(args.instance_list)
@@ -498,7 +508,7 @@ def main():
         probe = make_env_fn(
             instance_paths=instance_paths, seed=args.seed,
             max_iterations=args.max_iterations, time_limit=args.time_limit,
-            initial_lp_time_limit=args.initial_lp_time_limit,
+            initial_lp_time_limit=initial_lp_limit,
             stall_threshold=args.stall_threshold, max_stalls=args.max_stalls,
             cplex_threads=args.cplex_threads,
             max_reset_resamples=args.max_reset_resamples,
@@ -513,7 +523,7 @@ def main():
         instance_paths=instance_paths,
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
-        initial_lp_time_limit=args.initial_lp_time_limit,
+        initial_lp_time_limit=initial_lp_limit,
         stall_threshold=args.stall_threshold,
         max_stalls=args.max_stalls,
         cplex_threads=args.cplex_threads,

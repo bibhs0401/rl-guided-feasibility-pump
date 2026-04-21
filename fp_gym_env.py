@@ -9,7 +9,9 @@ from __future__ import annotations
 # Design:
 # - one episode = one instance
 # - one RL step = one FP decision window
-# - action = (flip_level, continuation_level)
+# - action = (flip_bin, continuation_bin): flip count + max natural FP iterations
+#   after the flip before the next RL step (see CONTINUATION_MAX_STEPS).  Wall-clock
+#   budget for the FP loop is still FPRunConfig.time_limit — not an RL action.
 # - Dict observation for SB3 MultiInputPolicy
 # -----------------------------------------------------------------------------
 
@@ -38,16 +40,15 @@ from mmp_fp_core import (
 # -----------------------------------------------------------------------------
 # Action menus
 # -----------------------------------------------------------------------------
-# We keep the action space exactly as planned:
-#
 # MultiDiscrete([6, 5])
 #
-# axis 0 -> flip level
-# axis 1 -> continuation / patience level
+# axis 0 -> flip_bin (maps to a flip count via flip_bin_to_count)
+# axis 1 -> continuation_bin: index into CONTINUATION_MAX_STEPS — a cap on how many
+#           natural FP iterations may run after the flip before control returns to
+#           the agent (unless stall/done first).  This is NOT FPRunConfig.stall_threshold
+#           and does not change stall detection in mmp_fp_core.
 #
-# Flip levels are relative to the number of integer variables.
-# Continuation levels scale the stall threshold temporarily for the next
-# decision window.
+# Flip magnitudes are relative to the number of integer variables.
 # -----------------------------------------------------------------------------
 
 def flip_bin_to_count(bin_index: int, n_integer: int) -> int:
@@ -78,10 +79,11 @@ def flip_bin_to_count(bin_index: int, n_integer: int) -> int:
 
 
 # Continuation bins map to a maximum number of natural FP iterations that
-# may run before control returns to the agent.  A larger value lets FP run
-# longer between interventions; a smaller value returns control sooner.
-# These are genuine action semantics: advance_until_stall_or_done(max_steps)
-# now respects this limit, so the action dimension actually affects behaviour.
+# may run after the flip before control returns to the agent.  A larger value
+# lets FP run longer between RL interventions; a smaller value returns sooner.
+# Stall or termination ends the block early.  Implemented via
+# advance_until_stall_or_done(max_steps=...).  The global FP wall-clock limit
+# remains config.fp_config.time_limit (not learned).
 CONTINUATION_MAX_STEPS = (1, 3, 5, 10, 20)
 CONTINUATION_LABELS = ("very_short", "short", "medium", "long", "very_long")
 
@@ -133,8 +135,10 @@ class FeasibilityPumpRLEnv(gym.Env):
     Step:
         One step = one FP decision window
         Agent chooses:
-            - how many variables to flip
-            - how patient FP should be before handing control back again
+            - how many variables to flip (flip_bin)
+            - how many natural FP iterations may run after that flip before the next
+              RL step (continuation_bin -> CONTINUATION_MAX_STEPS), unless stall/done.
+        The FP loop's wall-clock budget is fixed by FPRunConfig.time_limit, not by the agent.
 
     Observation space:
         Dict with three components:
@@ -143,7 +147,7 @@ class FeasibilityPumpRLEnv(gym.Env):
             instance : static instance descriptors
 
     Action space:
-        MultiDiscrete([6, 5])
+        MultiDiscrete([6, 5]): flip_bin x continuation_bin (see module docstring).
     """
 
     metadata = {"render_modes": []}
@@ -161,8 +165,9 @@ class FeasibilityPumpRLEnv(gym.Env):
         # Action space
         # ---------------------------------------------------------------------
         # [flip_bin, continuation_bin]
-        # flip_bin: 0..5
-        # continuation_bin: 0..4
+        # flip_bin: 0..5  -> flip count
+        # continuation_bin: 0..4  -> index into CONTINUATION_MAX_STEPS (max natural
+        #                            FP iterations after flip before next RL step)
         # ---------------------------------------------------------------------
         self.action_space = spaces.MultiDiscrete([6, 5])
 
@@ -281,8 +286,9 @@ class FeasibilityPumpRLEnv(gym.Env):
         Pick a cached (problem, runner) pair, reset its FP state, and advance
         to the first usable decision point.
 
-        Uses pre-built CPLEX models (Fix 3): runner.reset_state() re-solves the
-        initial LP without rebuilding the model, so this is fast.
+        Uses pre-built CPLEX models (Fix 3): runner.reset_state() restores the
+        cached initial LP solution without rebuilding models or re-solving, so
+        this is fast.
 
         Fallback behaviour
         ------------------
@@ -309,7 +315,7 @@ class FeasibilityPumpRLEnv(gym.Env):
             problem, runner = self._ensure_built(idx)
 
             logger.info(
-                "[reset ep=%d] attempt=%d/%d  instance=%s  (resetting LP …)",
+                "[reset ep=%d] attempt=%d/%d  instance=%s  (episode reset …)",
                 self.episode_id + 1,
                 attempt + 1, self.config.max_reset_resamples,
                 Path(problem.instance_path).name,
@@ -667,12 +673,13 @@ class FeasibilityPumpRLEnv(gym.Env):
         One RL step = one FP decision window.
 
         Flow:
-        1. Decode action
+        1. Decode action (flip_bin, continuation_bin)
         2. Apply chosen flip count
-        3. Temporarily adjust patience / stall threshold
-        4. Advance FP naturally until next decision point or termination
-        5. Compute reward
-        6. Return Gymnasium tuple
+        3. Advance FP naturally for up to continuation_max_steps iterations (from
+           CONTINUATION_MAX_STEPS), or until stall/done/time budget — see
+           advance_until_stall_or_done(max_steps=...)
+        4. Compute reward
+        5. Return Gymnasium tuple
         """
         assert self.problem is not None
         assert self.runner is not None
