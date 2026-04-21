@@ -921,7 +921,7 @@ class FeasibilityPumpCore:
             return False
 
         num_flips = len(flip_indices)
-        prev_stalled = self.is_stalle d()
+        prev_stalled = self.is_stalled()
 
         # Apply perturbation to the rounded point if requested
         if flip_indices:
