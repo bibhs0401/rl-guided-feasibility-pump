@@ -492,22 +492,38 @@ def solve_relaxation_model(model: Model, x_vars, y_vars, max_seconds: Optional[f
     Solve the relaxation model and return:
         x_values, y_values, objective_value
 
-    Returns None if the solve fails.
+    Returns None only if no feasible solution was found at all.
+
+    Accepts time-limited feasible solutions — FP only needs a starting relaxed
+    point, not a proven LP optimum.  For large instances (m=9000, n=3000)
+    CPLEX finds a good feasible LP solution in seconds but can take hours to
+    close the optimality gap, so requiring "optimal" status would force an
+    unbounded solve even though the FP starting point is already good enough.
     """
     ok = solve_with_time_limit(model, max_seconds)
     if not ok:
         return None
 
-    if max_seconds is not None:
-        status = str(getattr(model.solve_details, "status", "")).lower()
-        if "optimal" not in status:
-            logger.warning(
-                "Initial LP relaxation stopped without proven optimality "
-                "(status=%s, limit=%.2fs). Marking instance as failed.",
-                getattr(model.solve_details, "status", "unknown"),
-                float(max_seconds),
-            )
-            return None
+    # Accept any status where CPLEX actually produced a solution (optimal OR
+    # time-limited feasible).  Reject only if truly no solution exists.
+    if model.solution is None:
+        status = str(getattr(model.solve_details, "status", "unknown"))
+        logger.warning(
+            "Initial LP relaxation produced no solution (status=%s, limit=%s). "
+            "Marking instance as failed.",
+            status,
+            f"{max_seconds:.2f}s" if max_seconds is not None else "none",
+        )
+        return None
+
+    status = str(getattr(model.solve_details, "status", "")).lower()
+    if "optimal" not in status:
+        logger.info(
+            "Initial LP relaxation stopped at time limit with feasible solution "
+            "(status=%s, limit=%.2fs). Using feasible point as FP start.",
+            getattr(model.solve_details, "status", "unknown"),
+            float(max_seconds) if max_seconds is not None else 0.0,
+        )
 
     x_values = [float(v.solution_value) for v in x_vars]
     y_values = [float(v.solution_value) for v in y_vars]
@@ -796,7 +812,9 @@ class FeasibilityPumpCore:
             self.relaxation_model,
             self.relaxation_x,
             self.relaxation_y,
-            max_seconds=None,  # no cap — solve to proven optimality once
+            # Respect the configured time limit but accept any feasible solution
+            # (not just proven-optimal) — see solve_relaxation_model docstring.
+            max_seconds=self.config.initial_lp_time_limit,
         )
         self.initial_lp_solve_seconds = time.time() - lp_started
         # Store as a tuple (x_relaxed, y_values, lp_obj) or None if infeasible.
