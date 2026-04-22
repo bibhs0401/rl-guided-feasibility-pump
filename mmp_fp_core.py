@@ -479,9 +479,68 @@ def build_relaxation_model(problem: ProblemInstance, cplex_threads: int = 1):
             y_i = c_i x + d_i
             0 <= x_j <= 1 for integer variables
             x_j >= 0 for all variables
+
+    Solver configuration
+    --------------------
+    This model is configured to solve with the **barrier algorithm and no
+    crossover**.  The rationale is documented in-line at the parameter-set
+    call below.  The distance-projection model in build_distance_model is
+    intentionally NOT configured this way — see its docstring.
     """
     model = Model(name="fp_relaxation")
     apply_cplex_threads(model, cplex_threads)
+
+    # -------------------------------------------------------------------------
+    # LP algorithm: barrier without crossover (initial LP only)
+    # -------------------------------------------------------------------------
+    # The initial LP relaxation is the slowest single solve in the whole
+    # pipeline: on our typical instances (m ~ 9000 rows, n ~ 3000 cols,
+    # sparse A) dual simplex — CPLEX's default choice here — can take on the
+    # order of minutes and is the reason FPRunConfig exposes a 200s wall-clock
+    # cap via `initial_lp_time_limit`.
+    #
+    # Why barrier (lpmethod = 4):
+    #   * Barrier / interior-point methods scale much better than simplex on
+    #     large sparse LPs.  A single Cholesky factorisation of (A A^T), plus
+    #     a small number of Newton-style iterations, replaces the millions of
+    #     pivots that simplex would otherwise perform.
+    #   * Barrier is internally parallel — its factorisation and back-solves
+    #     scale with `cplex_threads`.  Simplex is effectively serial, so
+    #     giving simplex more threads would not help here.
+    #   * This LP is solved only ONCE per instance.  The result is then
+    #     cached to disk (see initial_lp_disk_cache_path in build_models),
+    #     so subsequent process restarts skip the solve entirely.  Making
+    #     the first-ever solve faster is pure upside; there is no repeated
+    #     warm-start workflow that we would hurt by switching algorithms.
+    #
+    # Why crossover is disabled (barrier.crossover = -1):
+    #   * CPLEX's default after a barrier solve is to run *crossover*, which
+    #     pushes the interior-point solution to a nearby vertex (basic)
+    #     solution.  Crossover can cost as much wall time as the barrier
+    #     phase itself on large LPs.
+    #   * Feasibility Pump only needs a *feasible* relaxed point to start
+    #     rounding from — it does not need a basic solution, an optimal
+    #     vertex, or an LP basis that would later be warm-started.  This
+    #     matches the code in solve_relaxation_model, which already accepts
+    #     time-limited / non-optimal feasible points as the FP start.
+    #   * Skipping crossover therefore saves the vertex-recovery phase at
+    #     zero cost to downstream FP behaviour.
+    #
+    # Accepted values for barrier.crossover:
+    #     -1  no crossover (return the interior-point solution as-is)  <-- us
+    #      0  automatic (CPLEX default, usually runs crossover)
+    #      1  primal crossover
+    #      2  dual crossover
+    #
+    # IMPORTANT: these two parameter lines apply ONLY to the initial
+    # relaxation LP.  The distance-projection LP (build_distance_model)
+    # is solved O(100) times per episode with a one-row change each time;
+    # it benefits enormously from dual-simplex basis warm-starts and must
+    # stay on CPLEX defaults.  Do NOT copy these settings into
+    # build_distance_model.
+    # -------------------------------------------------------------------------
+    model.parameters.lpmethod = 4             # 4 = barrier
+    # model.parameters.barrier.crossover = -1   # -1 = no crossover
 
     # Decision variables
     x = model.continuous_var_list(problem.n, lb=0, name="x")
@@ -578,6 +637,21 @@ def build_distance_model(problem: ProblemInstance, cplex_threads: int = 1):
 
     The actual distance constraint depends on the current rounded point,
     so we add/remove that constraint dynamically during each solve.
+
+    Solver configuration
+    --------------------
+    This model is intentionally left on CPLEX defaults (dual simplex).
+    Unlike the initial relaxation, the distance model is solved O(100)
+    times per FP episode with only a single row added/removed each time
+    (see solve_distance_model).  Dual simplex re-optimises from the
+    previous optimal basis in a handful of pivots after such a small
+    change, which is by far the fastest option for this workload.
+
+    Do NOT switch this model to barrier: barrier has no warm start and
+    would re-do the Cholesky factorisation from scratch on every
+    iteration, erasing the basis-reuse speedup.  The barrier / no-crossover
+    setting in build_relaxation_model is deliberately confined to the
+    one-shot initial LP.
     """
     model = Model(name="fp_distance")
     apply_cplex_threads(model, cplex_threads)
