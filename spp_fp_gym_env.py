@@ -127,7 +127,20 @@ class SetPackingFPRLEnv(gym.Env):
                 runner.advance_until_stall_or_done()
             if (not runner.done) and (not runner.failed) and runner.is_stalled():
                 return problem, runner
-        return last_problem, last_runner
+        if last_problem is None or last_runner is None:
+            raise RuntimeError(
+                "Could not load any set-packing instance. Check instance paths and formats."
+            )
+        raise RuntimeError(
+            "Could not sample a non-trivial set-packing instance within "
+            f"max_reset_resamples={self.config.max_reset_resamples}. "
+            f"Last candidate: {Path(last_problem.instance_path).name}, "
+            f"failed={last_runner.failed}, "
+            f"terminated_in_initial_relaxation={last_runner.terminated_in_initial_relaxation}, "
+            f"initial_lp_solve_seconds={last_runner.initial_lp_solve_seconds:.3f}. "
+            "Likely causes: initial LP time limit too small, incompatible instance files, "
+            "or all sampled instances are trivial."
+        )
 
     def _count_fractional_binaries(self) -> int:
         if self.runner is None or self.problem is None or self.runner.x_relaxed is None:
@@ -295,7 +308,23 @@ class SetPackingFPRLEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         if self.runner.done:
-            return self._build_observation(), 0.0, True, False, {"reason": "runner_already_done"}
+            info = {
+                "reason": "runner_already_done",
+                "instance_path": self.problem.instance_path if self.problem is not None else "",
+                "instance_name": (
+                    Path(self.problem.instance_path).name if self.problem is not None else ""
+                ),
+                "m": self.problem.m if self.problem is not None else 0,
+                "n": self.problem.n if self.problem is not None else 0,
+                "p": 1,
+                "failed": self.runner.failed if self.runner is not None else True,
+                "terminated_in_initial_relaxation": (
+                    self.runner.terminated_in_initial_relaxation
+                    if self.runner is not None
+                    else False
+                ),
+            }
+            return self._build_observation(), 0.0, True, False, info
         flip_bin = int(np.clip(int(action[0]), 0, 5))
         cont_bin = int(np.clip(int(action[1]), 0, 4))
         n_integer = max(1, len(self.problem.integer_indices))

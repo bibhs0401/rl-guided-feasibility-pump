@@ -32,6 +32,18 @@ def read_instance_list(file_path: str) -> List[str]:
     return out
 
 
+def read_instance_dir(instance_dir: str, pattern: str) -> List[str]:
+    base = Path(instance_dir)
+    if not base.exists():
+        raise FileNotFoundError(f"Instance directory not found: {instance_dir}")
+    if not base.is_dir():
+        raise ValueError(f"--instance-dir must point to a directory: {instance_dir}")
+    out = sorted(str(p.resolve()) for p in base.glob(pattern) if p.is_file())
+    if not out:
+        raise ValueError(f"No instance files matched pattern {pattern!r} in {instance_dir}")
+    return out
+
+
 def resolve_device(device_name: str) -> str:
     if device_name == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -397,7 +409,21 @@ def make_env_fn(
 
 def main():
     parser = argparse.ArgumentParser(description="Train PPO on set-packing FP env.")
-    parser.add_argument("--instance-list", required=True, help="Text file with one .npz or .lp path per line.")
+    parser.add_argument(
+        "--instance-list",
+        default="",
+        help="Text file with one .npz or .lp path per line.",
+    )
+    parser.add_argument(
+        "--instance-dir",
+        default="",
+        help="Directory to scan for instances (alternative to --instance-list).",
+    )
+    parser.add_argument(
+        "--instance-pattern",
+        default="*.lp",
+        help="Glob pattern used with --instance-dir, e.g. '*.lp' or '*.npz'.",
+    )
     parser.add_argument("--pool-size", type=int, default=0, help="Use first N instances (0=all)")
     parser.add_argument("--run-dir", default="runs/spp_fp_ppo")
     parser.add_argument("--run-name", default="trial_1")
@@ -430,7 +456,12 @@ def main():
     args = parser.parse_args()
 
     initial_lp_limit = None if args.initial_lp_optimal else args.initial_lp_time_limit
-    instance_paths = read_instance_list(args.instance_list)
+    if bool(args.instance_list) == bool(args.instance_dir):
+        raise ValueError("Provide exactly one of --instance-list or --instance-dir.")
+    if args.instance_list:
+        instance_paths = read_instance_list(args.instance_list)
+    else:
+        instance_paths = read_instance_dir(args.instance_dir, args.instance_pattern)
     if args.pool_size and args.pool_size < len(instance_paths):
         instance_paths = instance_paths[: args.pool_size]
 
