@@ -52,6 +52,7 @@ def run_quick(args: argparse.Namespace) -> tuple[list[FPResult], list[dict]]:
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
         stall_length=args.stall_length,
+        cplex_threads=args.cplex_threads,
         verbose=args.verbose,
         allow_heuristic_fallback=True,
     )
@@ -68,6 +69,7 @@ def run_quick(args: argparse.Namespace) -> tuple[list[FPResult], list[dict]]:
             stall_length=args.stall_length,
             random_seed=args.seed,
             baseline_action=args.baseline_action,
+            cplex_threads=args.cplex_threads,
             verbose=args.verbose,
         )
         results.append(run_baseline_fp(instance, baseline_cfg, perturb_on_stall=True))
@@ -78,6 +80,7 @@ def run_quick(args: argparse.Namespace) -> tuple[list[FPResult], list[dict]]:
             stall_length=args.stall_length,
             random_seed=args.seed,
             baseline_action=args.baseline_action,
+            cplex_threads=args.cplex_threads,
             verbose=args.verbose,
         )
         results.append(
@@ -120,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=40)
     parser.add_argument("--time-limit", type=float, default=5.0)
     parser.add_argument("--stall-length", type=int, default=2)
+    parser.add_argument("--cplex-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()

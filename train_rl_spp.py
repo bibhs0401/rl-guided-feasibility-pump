@@ -31,6 +31,7 @@ def create_env(instance_paths: Sequence[str], args: argparse.Namespace) -> SPPFe
         time_limit=args.time_limit,
         stall_length=args.stall_length,
         random_seed=args.seed,
+        cplex_threads=args.cplex_threads,
         verbose=args.verbose,
     )
     env_cfg = SPPRLEnvConfig(
@@ -52,6 +53,7 @@ def train_or_create_policy(
     time_limit: float = 10.0,
     stall_length: int = 3,
     continuation_steps: int | None = None,
+    cplex_threads: int = 1,
     verbose: bool = False,
     allow_heuristic_fallback: bool = True,
 ) -> str:
@@ -66,6 +68,7 @@ def train_or_create_policy(
     args.max_iterations = max_iterations
     args.time_limit = time_limit
     args.stall_length = stall_length
+    args.cplex_threads = cplex_threads
     args.seed = seed
     args.verbose = verbose
     args.continuation_steps = continuation_steps
@@ -158,6 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int, default=80)
     parser.add_argument("--time-limit", type=float, default=10.0)
     parser.add_argument("--stall-length", type=int, default=3)
+    parser.add_argument("--cplex-threads", type=int, default=1)
     parser.add_argument("--continuation-steps", type=int, default=None)
     parser.add_argument("--no-heuristic-fallback", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=3)
@@ -181,6 +185,7 @@ def main() -> None:
         time_limit=args.time_limit,
         stall_length=args.stall_length,
         continuation_steps=args.continuation_steps,
+        cplex_threads=args.cplex_threads,
         verbose=args.verbose,
         allow_heuristic_fallback=not args.no_heuristic_fallback,
     )

@@ -6,10 +6,9 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
-from scipy.optimize import linprog
 
 from spp_model import (
     DEFAULT_TOLERANCE,
@@ -37,6 +36,7 @@ class FPConfig:
     random_seed: int = 0
     baseline_action: int = 2
     stop_on_repaired_incumbent: bool = False
+    cplex_threads: int = 1
     verbose: bool = True
 
 
@@ -65,47 +65,93 @@ class StepOutcome:
     message: str = ""
 
 
+@dataclass
+class CplexSolveResult:
+    success: bool
+    x: Optional[np.ndarray]
+    message: str
+    objective_value: Optional[float] = None
+
+
 def _log(enabled: bool, msg: str) -> None:
     if enabled:
         print(msg, flush=True)
 
 
-def _linprog_options(time_limit: Optional[float]) -> dict:
-    options = {"presolve": True}
+def _iter_csr_row(instance: SPPInstance, row_index: int):
+    A = instance.A
+    start, end = A.indptr[row_index], A.indptr[row_index + 1]
+    for j, value in zip(A.indices[start:end], A.data[start:end]):
+        yield int(j), float(value)
+
+
+def _new_cplex_model(name: str, time_limit: Optional[float], cplex_threads: int):
+    try:
+        from docplex.mp.model import Model
+    except ModuleNotFoundError:
+        return None, (
+            "DOCplex/CPLEX is not installed in this Python environment. "
+            "Install with: python -m pip install docplex cplex"
+        )
+
+    model = Model(name=name)
+    model.context.cplex_parameters.threads = max(1, int(cplex_threads))
+    model.parameters.simplex.tolerances.feasibility = 1e-7
+    model.parameters.simplex.tolerances.optimality = 1e-7
     if time_limit is not None:
-        options["time_limit"] = max(0.01, float(time_limit))
-    return options
+        model.set_time_limit(max(0.01, float(time_limit)))
+    return model, ""
 
 
-def solve_lp_relaxation(instance: SPPInstance, time_limit: Optional[float] = None):
-    c = -np.asarray(instance.profits, dtype=float)
-    bounds = [(0.0, 1.0)] * instance.n
-    return linprog(
-        c,
-        A_ub=instance.A,
-        b_ub=instance.b,
-        bounds=bounds,
-        method="highs",
-        options=_linprog_options(time_limit),
-    )
+def _solve_docplex_model(model, variables: Sequence, log_output: bool = False) -> CplexSolveResult:
+    solution = model.solve(log_output=log_output)
+    status = str(model.solve_details.status) if model.solve_details is not None else "unknown"
+    if solution is None:
+        return CplexSolveResult(False, None, f"CPLEX solve failed: {status}")
+    values = np.asarray([float(solution.get_value(var)) for var in variables], dtype=float)
+    return CplexSolveResult(True, values, f"CPLEX status: {status}", float(model.objective_value))
+
+
+def solve_lp_relaxation(
+    instance: SPPInstance,
+    time_limit: Optional[float] = None,
+    cplex_threads: int = 1,
+) -> CplexSolveResult:
+    model, error = _new_cplex_model("spp_lp_relaxation", time_limit, cplex_threads)
+    if model is None:
+        return CplexSolveResult(False, None, error)
+    x = model.continuous_var_list(instance.n, lb=0.0, ub=1.0, name="x")
+    for i in range(instance.m):
+        model.add_constraint(
+            model.sum(value * x[j] for j, value in _iter_csr_row(instance, i)) <= float(instance.b[i]),
+            ctname=f"packing_{i}",
+        )
+    model.maximize(model.sum(float(instance.profits[j]) * x[j] for j in range(instance.n)))
+    return _solve_docplex_model(model, x)
 
 
 def solve_distance_projection(
     instance: SPPInstance,
     rounded: Sequence[float],
     time_limit: Optional[float] = None,
-):
+    cplex_threads: int = 1,
+) -> CplexSolveResult:
     target = np.asarray(rounded, dtype=float)
-    c = np.where(target > 0.5, -1.0, 1.0)
-    bounds = [(0.0, 1.0)] * instance.n
-    return linprog(
-        c,
-        A_ub=instance.A,
-        b_ub=instance.b,
-        bounds=bounds,
-        method="highs",
-        options=_linprog_options(time_limit),
+    model, error = _new_cplex_model("spp_distance_projection", time_limit, cplex_threads)
+    if model is None:
+        return CplexSolveResult(False, None, error)
+    z = model.continuous_var_list(instance.n, lb=0.0, ub=1.0, name="z")
+    for i in range(instance.m):
+        model.add_constraint(
+            model.sum(value * z[j] for j, value in _iter_csr_row(instance, i)) <= float(instance.b[i]),
+            ctname=f"packing_{i}",
+        )
+    distance_objective = model.sum(
+        z[j] if target[j] < 0.5 else (1.0 - z[j])
+        for j in range(instance.n)
     )
+    model.minimize(distance_objective)
+    return _solve_docplex_model(model, z)
 
 
 def fp_distance(lp_solution: Sequence[float], rounded: Sequence[float]) -> float:
@@ -174,7 +220,11 @@ class SPPFeasibilityPump:
     def reset(self) -> None:
         self.start_time = time.time()
         _log(self.config.verbose, f"[{self.instance.name}] solving LP relaxation")
-        res = solve_lp_relaxation(self.instance, self.config.time_limit)
+        res = solve_lp_relaxation(
+            self.instance,
+            self.config.time_limit,
+            cplex_threads=self.config.cplex_threads,
+        )
         self.last_lp_status = str(res.message)
         _log(self.config.verbose, f"[{self.instance.name}] LP relaxation status: {res.message}")
         if not res.success:
@@ -276,7 +326,12 @@ class SPPFeasibilityPump:
         if self.done:
             return StepOutcome(True, False, self.success, "repair_feasible")
 
-        res = solve_distance_projection(self.instance, self.x_binary, self.remaining_time())
+        res = solve_distance_projection(
+            self.instance,
+            self.x_binary,
+            self.remaining_time(),
+            cplex_threads=self.config.cplex_threads,
+        )
         _log(self.config.verbose, f"[{self.instance.name}] projection LP status: {res.message}")
         if not res.success:
             self.failed = True
@@ -494,6 +549,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit", type=float, default=30.0)
     parser.add_argument("--stall-length", type=int, default=3)
     parser.add_argument("--baseline-action", type=int, default=2, choices=range(5))
+    parser.add_argument("--cplex-threads", type=int, default=1)
     parser.add_argument("--no-perturb", action="store_true")
     parser.add_argument("--output", default="results/baseline_fp_results.csv")
     parser.add_argument("--quiet", action="store_true")
@@ -517,6 +573,7 @@ def main() -> None:
             time_limit=args.time_limit,
             stall_length=args.stall_length,
             baseline_action=args.baseline_action,
+            cplex_threads=args.cplex_threads,
             verbose=not args.quiet,
         )
         results.append(run_baseline_fp(instance, cfg, perturb_on_stall=not args.no_perturb))

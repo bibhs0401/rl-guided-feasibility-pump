@@ -59,6 +59,7 @@ class SPPFeasibilityPumpEnv(gym.Env):
             random_seed=int(self.rng.integers(0, 2**31 - 1)),
             baseline_action=self.config.fp_config.baseline_action,
             stop_on_repaired_incumbent=False,
+            cplex_threads=self.config.fp_config.cplex_threads,
             verbose=self.config.fp_config.verbose,
         )
         runner = SPPFeasibilityPump(self.problem, cfg)

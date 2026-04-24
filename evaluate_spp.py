@@ -197,6 +197,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit", type=float, default=30.0)
     parser.add_argument("--stall-length", type=int, default=3)
     parser.add_argument("--baseline-action", type=int, default=2, choices=range(5))
+    parser.add_argument("--cplex-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="results/spp_comparison.csv")
     parser.add_argument("--summary-output", default="results/spp_summary.csv")
@@ -219,6 +220,7 @@ def main() -> None:
             stall_length=args.stall_length,
             random_seed=args.seed,
             baseline_action=args.baseline_action,
+            cplex_threads=args.cplex_threads,
             verbose=not args.quiet,
         )
         results.append(run_baseline_fp(instance, baseline_cfg, perturb_on_stall=True))
@@ -229,6 +231,7 @@ def main() -> None:
             stall_length=args.stall_length,
             random_seed=args.seed,
             baseline_action=args.baseline_action,
+            cplex_threads=args.cplex_threads,
             verbose=not args.quiet,
         )
         results.append(
