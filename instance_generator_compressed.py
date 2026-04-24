@@ -7,11 +7,19 @@ random.seed(10)
 np.random.seed(10)
 
 
-def rowcolumn():
+def rowcolumn(n_value: int = 1500, m_value: int | None = None, p_value: int = 3):
     m, n, p = [], [], []
-    n = [1500]  # number of decision variables (x) (j)
-    m = [3000]  # number of constraints (i)
-    p.append(3)  # number of objectives
+    n = [int(n_value)]  # number of decision variables (x) (j)
+    if n[0] < 1:
+        raise ValueError("n must be >= 1")
+    m_resolved = int(2 * n[0]) if m_value is None else int(m_value)
+    if m_resolved < 1:
+        raise ValueError("m must be >= 1")
+    p_resolved = int(p_value)
+    if p_resolved < 1:
+        raise ValueError("p must be >= 1")
+    m = [m_resolved]  # number of constraints (i)
+    p.append(p_resolved)  # number of objectives
     return m, n, p
 
 
@@ -68,8 +76,8 @@ def data(m, n, p):
     return A_mat, b, c_mat, d, BigM
 
 
-def write_compressed(idx: int, out_dir: str):
-    m, n, p = rowcolumn()
+def write_compressed(idx: int, out_dir: str, n_value: int, m_value: int | None, p_value: int):
+    m, n, p = rowcolumn(n_value=n_value, m_value=m_value, p_value=p_value)
     A_mat, b, c_mat, d, BigM = data(m, n, p)
     out_path = os.path.join(out_dir, f"matrices{idx}.npz")
     np.savez_compressed(out_path, A=A_mat, b=b, c=c_mat, d=d, BigM=BigM, m=m, n=n, p=p)
@@ -103,6 +111,19 @@ def parse_args():
     parser.add_argument("--num-instances", type=int, default=10, help="Number of instances")
     parser.add_argument("--out-dir", type=str, default=".", help="Output directory")
     parser.add_argument("--seed", type=int, default=10, help="Random seed")
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=1500,
+        help="Set-packing subclass size (number of decision variables).",
+    )
+    parser.add_argument(
+        "--m",
+        type=int,
+        default=None,
+        help="Number of constraints. Default is 2*n when omitted.",
+    )
+    parser.add_argument("--p", type=int, default=3, help="Number of objectives.")
     parser.add_argument("--write-npz", action="store_true", help="Also write legacy .npz files")
     return parser.parse_args()
 
@@ -114,7 +135,13 @@ def main():
     np.random.seed(args.seed)
 
     for j in range(1, args.num_instances + 1):
-        A_mat, npz_path = write_compressed(j, args.out_dir)
+        A_mat, npz_path = write_compressed(
+            j,
+            args.out_dir,
+            n_value=args.n,
+            m_value=args.m,
+            p_value=args.p,
+        )
         lp_path = os.path.join(args.out_dir, f"set_packing_{j}.lp")
         write_set_packing_lp(A_mat, lp_path)
         if not args.write_npz and os.path.exists(npz_path):

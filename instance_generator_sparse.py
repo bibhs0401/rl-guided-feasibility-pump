@@ -340,18 +340,9 @@ def parse_args():
         action="store_true",
         default=True,
         help=(
-            "Pick n independently for each instance from --n-choices "
-            "(set-packing default: 500,600,700). "
+            "Pick n independently for each instance from {300, 400, ..., 1000} "
+            "(paper: 'randomly from the integer set ranging from 300 to 1000, by 100'). "
             "Ignored when --n is set explicitly."
-        ),
-    )
-    parser.add_argument(
-        "--n-choices",
-        type=str,
-        default="500,600,700",
-        help=(
-            "Comma-separated n values used when --n is not provided, "
-            "e.g. '500,600,700'."
         ),
     )
     parser.add_argument(
@@ -368,19 +359,14 @@ if __name__ == "__main__":
     out_dir = args.out_dir
     random.seed(args.seed)
 
-    # Set-packing subclasses from the table: n in {500, 600, 700} by default.
-    # --n overrides this; otherwise values are taken from --n-choices.
-    N_CHOICES = [int(x.strip()) for x in args.n_choices.split(",") if x.strip()]
-    if not N_CHOICES:
-        raise ValueError("--n-choices must contain at least one integer value")
-    if any(v < 1 for v in N_CHOICES):
-        raise ValueError("--n-choices values must all be >= 1")
+    # Paper: n randomly selected from {300, 400, 500, 600, 700, 800, 900, 1000}.
+    # --n overrides this; otherwise --random-n (default True) applies.
+    N_CHOICES = list(range(300, 1001, 100))
     use_random_n = (args.n is None)
-    n_choices_label = "{" + ", ".join(str(v) for v in N_CHOICES) + "}"
 
     print(
         f"Starting generation: instances={args.num_instances}, seed={args.seed}, p={args.p}, "
-        f"n={f'random from {n_choices_label}' if use_random_n else args.n}, out_dir={out_dir}"
+        f"n={'random from {300..1000}' if use_random_n else args.n}, out_dir={out_dir}"
     )
     for i in range(args.num_instances):
         n_i = random.choice(N_CHOICES) if use_random_n else args.n
