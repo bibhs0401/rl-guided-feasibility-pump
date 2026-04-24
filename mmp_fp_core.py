@@ -3,6 +3,7 @@ from __future__ import annotations
 # Standard library imports
 import logging
 import pickle
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -59,7 +60,7 @@ INTEGER_TOLERANCE = 1e-6
 # Data containers
 # -----------------------------------------------------------------------------
 # ProblemInstance:
-#   Holds one instance in matrix/vector form after reading the .npz file.
+#   Holds one instance in matrix/vector form after reading a .npz or .lp file.
 #
 # FPRunConfig:
 #   Holds the solver-facing FP configuration for one run.
@@ -67,7 +68,7 @@ INTEGER_TOLERANCE = 1e-6
 @dataclass
 class ProblemInstance:
     """
-    One MMP instance loaded from a sparse .npz file.
+    One MMP instance loaded from a sparse .npz archive or a CPLEX .lp file.
 
     Fields
     ------
@@ -240,6 +241,287 @@ def load_npz_instance(instance_path: str | Path) -> ProblemInstance:
         n=n,
         p=p,
         integer_indices=integer_indices,
+    )
+
+
+# -----------------------------------------------------------------------------
+# CPLEX .lp import (format produced by instance_generator_sparse.save_instance_lp)
+# -----------------------------------------------------------------------------
+
+
+def _lp_extract_subject_to_body(text: str) -> str:
+    m = re.search(
+        r"(?is)Subject To\s*(.*?)(?=^\s*(?:Bounds|Binary|End)\s*$)",
+        text,
+        re.MULTILINE,
+    )
+    if not m:
+        raise ValueError("Could not find a Subject To / Bounds (or End) block in the .lp file.")
+    return m.group(1).strip()
+
+
+def _lp_iter_constraint_blocks(subject_body: str) -> list[str]:
+    """
+    Split the Subject To body into one string per named constraint, keeping
+    generator-style line continuations.
+    """
+    lines = subject_body.splitlines()
+    blocks: list[str] = []
+    cur: list[str] = []
+    for line in lines:
+        if re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", line) and cur:
+            blocks.append("\n".join(cur))
+            cur = [line]
+        else:
+            if not cur and not line.strip():
+                continue
+            if not cur and line.strip() and re.match(
+                r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", line
+            ) is None:
+                continue
+            if cur or line.strip():
+                cur.append(line)
+    if cur:
+        blocks.append("\n".join(cur))
+    return [b for b in blocks if b.strip()]
+
+
+def _lp_normalize_unary_y(lhs: str) -> str:
+    """Map CPLEX '- y1' to '-1.0 y1' (the generator does not print an explicit 1)."""
+    s = re.sub(r"(?<![\d.])\s*-\s*y([0-9]+)", r" -1.0 y\1", lhs)
+    s = re.sub(r"(?<![\d.])\s*\+\s*y([0-9]+)", r" 1.0 y\1", s)
+    return s
+
+
+def _lp_parse_linear_terms(lhs: str) -> dict[str, float]:
+    """
+    Parse a CPLEX-style linear expression into variable -> coefficient.
+    Coefficients are always explicit in our generator, except for unary '- yk'.
+    """
+    lhs_1 = _lp_normalize_unary_y(lhs)
+    one_line = re.sub(r"[\r\n\t]+", " ", lhs_1)
+    one_line = re.sub(r"\s+", " ", one_line).strip()
+
+    if not one_line or one_line in ("0", "0.0"):
+        return {}
+
+    # Term pattern: (signed float) (varname)
+    term_re = re.compile(
+        r"([+-]?(?:\d+\.?\d*|\d*\.\d+)(?:[eE][-+]?\d+)?)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    )
+    out: dict[str, float] = {}
+    for coef_s, vname in term_re.findall(one_line):
+        c = float(coef_s)
+        if vname not in out:
+            out[vname] = 0.0
+        out[vname] += c
+
+    return out
+
+
+def _lp_parse_one_constraint_block(block: str) -> tuple[str, str, float, dict[str, float]]:
+    """
+    Return (name, sense, rhs, terms) where sense is 'L' (<=) or 'E' (=).
+    """
+    m = re.match(
+        r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:(.*)\Z",
+        block,
+        re.DOTALL,
+    )
+    if not m:
+        raise ValueError(f"Invalid constraint block (expected name: ...): {block!r}")
+    cname, body = m.group(1), m.group(2)
+    btxt = re.sub(r"[\n\r\t]+", " ", body)
+    btxt = re.sub(r"\s+", " ", btxt).strip()
+
+    if "<=" in btxt:
+        lhs, rhs_s = btxt.rsplit("<=", 1)
+        sense = "L"
+    elif "=" in btxt:
+        lhs, rhs_s = btxt.rsplit("=", 1)
+        sense = "E"
+    else:
+        raise ValueError(f"Constraint has no <= or = : {btxt!r}")
+
+    terms = _lp_parse_linear_terms(lhs)
+    return cname, sense, float(rhs_s.strip()), terms
+
+
+def load_lp_instance(instance_path: str | Path) -> ProblemInstance:
+    """
+    Load an instance from a CPLEX .lp file (same MMP layout as the .npz path).
+
+    Supported layout matches instance_generator_sparse.save_instance_lp:
+        Ax <= b on rows c1..cm; objective links obj_y1..obj_yp with
+        c_k @ x - y_k = -d_k.
+    """
+    path = Path(instance_path)
+    if path.suffix.lower() != ".lp":
+        raise ValueError(f"Expected a .lp instance file, got: {path}")
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+
+    n_meta = m_meta = p_meta = None
+    cm = re.search(r"\\\s*n\s*=\s*(\d+)\s*,\s*m\s*=\s*(\d+)\s*,\s*p\s*=\s*(\d+)", text)
+    if cm:
+        n_meta, m_meta, p_meta = int(cm.group(1)), int(cm.group(2)), int(cm.group(3))
+
+    subject_body = _lp_extract_subject_to_body(text)
+    blocks = _lp_iter_constraint_blocks(subject_body)
+    if not blocks:
+        raise ValueError(f"Empty Subject To block in: {path}")
+
+    ax: dict[int, dict[str, float]] = {}
+    bvec: dict[int, float] = {}
+    oby: dict[int, dict[str, float]] = {}
+    drhs: dict[int, float] = {}
+
+    for b in blocks:
+        name, sense, rhs, terms = _lp_parse_one_constraint_block(b)
+        mc = re.match(r"^c(\d+)$", name, re.IGNORECASE)
+        mo = re.match(r"^obj_y(\d+)$", name, re.IGNORECASE)
+        if mc:
+            idx = int(mc.group(1)) - 1
+            if sense != "L":
+                raise ValueError(f"Expected Ax<=b (<=) for {name!r} in {path}, got {sense!r}.")
+            ax[idx] = terms
+            bvec[idx] = rhs
+        elif mo:
+            k = int(mo.group(1)) - 1
+            if sense != "E":
+                raise ValueError(f"Expected linear equality for {name!r} in {path}, got {sense!r}.")
+            yk = f"y{mo.group(1)}"
+            if yk not in terms:
+                raise ValueError(
+                    f"Expected {yk} in {name!r} in {path}, got terms {sorted(terms.keys())!r}."
+                )
+            if abs(terms[yk] + 1.0) > 1e-4:
+                raise ValueError(
+                    f"Expected {yk} coeff -1.0 in {name!r} in {path}, got {terms[yk]!r}."
+                )
+            tcopy = {k0: v0 for k0, v0 in terms.items() if not k0.startswith("y")}
+            oby[k] = tcopy
+            # yk = tcopy @ x + d_k, row is tcopy @ x - yk = -d_k, so rhs = -d_k
+            drhs[k] = -float(rhs)
+        else:
+            raise ValueError(
+                f"Unrecognized constraint name {name!r} in {path} "
+                f"(expected c1..cM and obj_y1..obj_yP)"
+            )
+
+    m_parsed, p_parsed = len(bvec), len(drhs)
+    if m_meta is not None and m_parsed != m_meta:
+        raise ValueError(
+            f"Header says m={m_meta} but found {m_parsed} Ax<=b rows in: {path}"
+        )
+    if p_meta is not None and p_parsed != p_meta:
+        raise ValueError(
+            f"Header says p={p_meta} but found {p_parsed} obj_y* rows in: {path}"
+        )
+    m, p = m_parsed, p_parsed
+
+    if set(range(m)) != set(bvec.keys()) or set(range(m)) != set(ax.keys()):
+        raise ValueError(
+            f"Missing or non-contiguous c1..c{m} rows when parsing: {path} "
+            f"(found rows {sorted(bvec.keys())!r})"
+        )
+    if set(range(p)) != set(drhs.keys()) or set(range(p)) != set(oby.keys()):
+        raise ValueError(
+            f"Missing or non-contiguous obj_y1..obj_y{p} when parsing: {path} "
+            f"(found {sorted(drhs.keys())!r})"
+        )
+
+    # Infer n as max x index present (names are x1..x{n})
+    x_indices: list[int] = []
+    for tmap in [ax[i] for i in range(m)] + [oby[i] for i in range(p)]:
+        for vname, val in tmap.items():
+            if vname.startswith("x"):
+                if val != 0.0:
+                    x_indices.append(int(vname[1:]))
+    if n_meta is not None:
+        n = n_meta
+    else:
+        if not x_indices:
+            raise ValueError(f"Could not infer n: no x variables in constraints in: {path}")
+        n = max(x_indices)
+    n_max_seen = max(x_indices) if x_indices else 0
+    if n < n_max_seen:
+        raise ValueError(
+            f"Header or inferred n={n} but constraints reference x{max(x_indices)} in: {path}"
+        )
+
+    b_arr = np.array([bvec[i] for i in range(m)], dtype=float)
+    d = np.array([drhs[i] for i in range(p)], dtype=float)
+
+    a_rows, a_cols, a_data = [], [], []
+    c_rows, c_cols, c_data = [], [], []
+    for i in range(m):
+        tmap = ax[i]
+        for vname, val in tmap.items():
+            if vname.startswith("x"):
+                j = int(vname[1:]) - 1
+            else:
+                raise ValueError(
+                    f"Non-x variable {vname!r} in Ax<=b row c{i+1} of {path}"
+                )
+            if not (0 <= j < n):
+                raise ValueError(f"Out-of-range {vname!r} (n={n}) in c{i+1} of {path}")
+            if val != 0.0:
+                a_rows.append(i)
+                a_cols.append(j)
+                a_data.append(float(val))
+    for k in range(p):
+        tmap = oby[k]
+        for vname, val in tmap.items():
+            if vname.startswith("x"):
+                j = int(vname[1:]) - 1
+            else:
+                raise ValueError(
+                    f"Non-x variable {vname!r} in obj_y row {k+1} of {path}"
+                )
+            if not (0 <= j < n):
+                raise ValueError(f"Out-of-range {vname!r} (n={n}) in obj_y{k+1} of {path}")
+            if val != 0.0:
+                c_rows.append(k)
+                c_cols.append(j)
+                c_data.append(float(val))
+
+    A = sparse.coo_matrix(
+        (a_data, (a_rows, a_cols)), shape=(m, n), dtype=float
+    ).tocsr()
+    c_mat = sparse.coo_matrix(
+        (c_data, (c_rows, c_cols)), shape=(p, n), dtype=float
+    ).toarray()
+    c = [c_mat[i].copy() for i in range(p)]
+
+    integer_indices = list(range(int(INTEGER_VARIABLE_FRACTION * n)))
+
+    return ProblemInstance(
+        instance_path=str(path),
+        A=A,
+        b=b_arr,
+        c=c,
+        d=d,
+        m=m,
+        n=n,
+        p=p,
+        integer_indices=integer_indices,
+    )
+
+
+def load_instance(instance_path: str | Path) -> ProblemInstance:
+    """
+    Load a problem instance from .npz (sparse archive) or .lp (CPLEX LP).
+    """
+    path = Path(instance_path)
+    suf = path.suffix.lower()
+    if suf == ".npz":
+        return load_npz_instance(path)
+    if suf == ".lp":
+        return load_lp_instance(path)
+    raise ValueError(
+        f"Unsupported instance file type {path.suffix!r} "
+        f"(expected .npz or .lp): {path}"
     )
 
 
@@ -1257,7 +1539,7 @@ def run_single_fp_episode(instance_path: str | Path, config: Optional[FPRunConfi
     This is not RL yet. It is just a real working backend run.
     """
     cfg = config or FPRunConfig()
-    problem = load_npz_instance(instance_path)
+    problem = load_instance(instance_path)
     runner = FeasibilityPumpCore(problem, cfg)
 
     # Initialize FP
@@ -1308,14 +1590,20 @@ def run_single_fp_episode(instance_path: str | Path, config: Optional[FPRunConfi
 # -----------------------------------------------------------------------------
 # CLI entry point
 # -----------------------------------------------------------------------------
-# This lets you run the backend directly on one .npz instance from the terminal.
+# This lets you run the backend directly on one instance from the terminal.
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     import json
 
-    parser = argparse.ArgumentParser(description="Run real FP core on one .npz instance.")
-    parser.add_argument("--instance", required=True, help="Path to one .npz instance")
+    parser = argparse.ArgumentParser(
+        description="Run real FP core on one .npz or .lp instance."
+    )
+    parser.add_argument(
+        "--instance",
+        required=True,
+        help="Path to one .npz or .lp instance",
+    )
     parser.add_argument("--time-limit", type=float, default=30.0)
     parser.add_argument("--max-iterations", type=int, default=100)
     parser.add_argument("--stall-threshold", type=int, default=3)

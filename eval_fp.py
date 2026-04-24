@@ -299,8 +299,11 @@ def main():
     parser = argparse.ArgumentParser(
         description="Evaluate FP variants (baseline / random / RL) on a fixed instance pool."
     )
-    parser.add_argument("--instances", required=True,
-                        help="Path to a .txt file with one .npz path per line.")
+    parser.add_argument(
+        "--instances",
+        required=True,
+        help="Path to a .txt file with one .npz or .lp path per line.",
+    )
     parser.add_argument("--methods", default="baseline,random,rl",
                         help="Comma-separated methods from {baseline,random,rl}.")
     parser.add_argument("--rl-model", default="",

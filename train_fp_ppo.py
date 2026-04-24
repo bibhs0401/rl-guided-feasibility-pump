@@ -426,7 +426,7 @@ def main():
     # Data
     parser.add_argument(
         "--instance-list", required=True,
-        help="Text file with one .npz path per line.",
+        help="Text file with one .npz or .lp path per line.",
     )
     parser.add_argument(
         "--pool-size", type=int, default=0,

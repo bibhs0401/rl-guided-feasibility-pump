@@ -32,8 +32,8 @@ from mmp_fp_core import (
     FPRunConfig,
     FeasibilityPumpCore,
     ProblemInstance,
-    load_npz_instance,
     fp_distance,
+    load_instance,
 )
 
 
@@ -156,7 +156,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         super().__init__()
 
         if not config.instance_paths:
-            raise ValueError("config.instance_paths must contain at least one .npz file")
+            raise ValueError("config.instance_paths must contain at least one .npz or .lp path")
 
         self.config = config
         self.rng = np.random.default_rng(config.seed)
@@ -218,7 +218,7 @@ class FeasibilityPumpRLEnv(gym.Env):
         # ---------------------------------------------------------------------
         # Lazy model cache — CPLEX models are built on first access, not upfront.
         #
-        # _instance_paths  : ordered list of .npz paths from config
+        # _instance_paths  : ordered list of .npz or .lp paths from config
         # _instance_cache  : parallel list; None until the slot is first used,
         #                    then (ProblemInstance, FeasibilityPumpCore)
         # _n_built         : counter for logging
@@ -253,7 +253,7 @@ class FeasibilityPumpRLEnv(gym.Env):
             return self._instance_cache[idx]
 
         path = self._instance_paths[idx]
-        problem = load_npz_instance(path)
+        problem = load_instance(path)
         runner = FeasibilityPumpCore(problem, self.config.fp_config)
         runner.build_models()
 

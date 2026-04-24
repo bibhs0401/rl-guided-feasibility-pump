@@ -106,12 +106,12 @@ def write_txt_list(path: Path, rows: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Screen .npz instances with baseline FP and identify hard instances."
+        description="Screen .npz or .lp instances with baseline FP and identify hard cases."
     )
     parser.add_argument(
         "--instances",
         required=True,
-        help="Glob pattern for .npz instances, for example 'instances_n3000/*.npz'",
+        help="Glob for instances, e.g. 'instances_n3000/*.npz' or 'instances_out/*.lp'",
     )
     parser.add_argument(
         "--out-dir",
@@ -158,7 +158,9 @@ def main():
 
     instance_paths: List[str] = sorted(glob.glob(args.instances))
     if not instance_paths:
-        raise FileNotFoundError(f"No .npz files matched: {args.instances}")
+        raise FileNotFoundError(
+            f"No instance files matched (expected .npz or .lp): {args.instances}"
+        )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
