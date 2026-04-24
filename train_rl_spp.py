@@ -58,7 +58,7 @@ def create_env(instance_paths: Sequence[str], args: argparse.Namespace) -> SPPFe
         instance_paths=list(instance_paths),
         fp_config=fp_cfg,
         seed=args.seed,
-        continuation_steps_after_action=args.continuation_steps,
+        # continuation_steps is now action dim 1 (MultiDiscrete), not a fixed config
     )
     return SPPFeasibilityPumpEnv(env_cfg)
 
@@ -181,7 +181,6 @@ def train_or_create_policy(
     max_iterations: int = 80,
     time_limit: float = 10.0,
     stall_length: int = 3,
-    continuation_steps: int | None = None,
     cplex_threads: int = 1,
     log_every_episodes: int = 5,
     rolling_window: int = 20,
@@ -189,6 +188,7 @@ def train_or_create_policy(
     verbose: bool = False,
     allow_heuristic_fallback: bool = True,
 ) -> str:
+    # NOTE: continuation_steps removed — it is now action dimension 1 of MultiDiscrete([6,5])
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     policy_path = out / f"{algorithm.lower()}_spp_fp_policy"
@@ -203,7 +203,6 @@ def train_or_create_policy(
     args.cplex_threads = cplex_threads
     args.seed = seed
     args.verbose = verbose
-    args.continuation_steps = continuation_steps
 
     try:
         from stable_baselines3 import A2C, PPO
@@ -225,11 +224,22 @@ def train_or_create_policy(
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "reason": "stable_baselines3_not_installed",
                     "action_space": {
-                        "0": "skip",
-                        "1": "flip_1_percent",
-                        "2": "flip_5_percent",
-                        "3": "flip_10_percent",
-                        "4": "flip_20_percent",
+                        "type": "MultiDiscrete([6, 5])",
+                        "dim0_flip_bins": {
+                            "0": "flip_1_var",
+                            "1": "flip_1_percent",
+                            "2": "flip_2_percent",
+                            "3": "flip_5_percent",
+                            "4": "flip_10_percent",
+                            "5": "flip_20_percent",
+                        },
+                        "dim1_continuation_bins": {
+                            "0": "very_short_1_step",
+                            "1": "short_3_steps",
+                            "2": "medium_5_steps",
+                            "3": "long_10_steps",
+                            "4": "very_long_20_steps",
+                        },
                     },
                 },
                 indent=2,
@@ -248,7 +258,8 @@ def train_or_create_policy(
     env = DummyVecEnv([make_env])
     algo_name = algorithm.upper()
     model_cls = PPO if algo_name == "PPO" else A2C
-    model = model_cls("MlpPolicy", env, verbose=1 if verbose else 0, seed=seed)
+    # Dict observation space requires MultiInputPolicy (SB3 auto-builds one branch per key)
+    model = model_cls("MultiInputPolicy", env, verbose=1 if verbose else 0, seed=seed)
     aggregate_log_path = Path(aggregate_log_csv) if aggregate_log_csv else out / "training_aggregate_logs.csv"
     AggregateLogger = build_aggregate_logger_class(BaseCallback)
     callbacks = CallbackList(
@@ -273,6 +284,7 @@ def smoke_test_policy(policy_path: str, instance_paths: Sequence[str], args: arg
     total_return = 0.0
     for _ in range(args.smoke_steps):
         if policy_path.endswith(".json"):
+            # heuristic_action_from_observation now returns np.ndarray([flip, cont])
             action = heuristic_action_from_observation(obs)
         else:
             try:
@@ -282,8 +294,9 @@ def smoke_test_policy(policy_path: str, instance_paths: Sequence[str], args: arg
             else:
                 model_cls = PPO if args.algorithm.upper() == "PPO" else A2C
                 model = model_cls.load(policy_path)
+                # predict returns an array for MultiDiscrete; pass dict obs directly
                 action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(int(action))
+        obs, reward, terminated, truncated, info = env.step(action)
         total_return += reward
         if terminated or truncated:
             break
@@ -307,7 +320,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit", type=float, default=10.0)
     parser.add_argument("--stall-length", type=int, default=3)
     parser.add_argument("--cplex-threads", type=int, default=1)
-    parser.add_argument("--continuation-steps", type=int, default=None)
+    # --continuation-steps removed: continuation depth is now action dim 1 (MultiDiscrete)
     parser.add_argument("--log-every-episodes", type=int, default=5)
     parser.add_argument("--rolling-window", type=int, default=20)
     parser.add_argument(
@@ -336,7 +349,6 @@ def main() -> None:
         max_iterations=args.max_iterations,
         time_limit=args.time_limit,
         stall_length=args.stall_length,
-        continuation_steps=args.continuation_steps,
         cplex_threads=args.cplex_threads,
         log_every_episodes=args.log_every_episodes,
         rolling_window=args.rolling_window,

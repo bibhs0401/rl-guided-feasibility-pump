@@ -24,7 +24,13 @@ from spp_model import (
 )
 
 
-ACTION_PROPORTIONS = (0.0, 0.01, 0.05, 0.10, 0.20)
+# 6 flip bins: None = exactly 1 variable, others are proportions of n.
+# Matches slide: bin0=1var, bin1=1%, bin2=2%, bin3=5%, bin4=10%, bin5=20%
+ACTION_PROPORTIONS: tuple = (None, 0.01, 0.02, 0.05, 0.10, 0.20)
+
+# 5 continuation bins: max FP iterations after a perturbation before re-intervening.
+# Matches slide: very short, short, medium, long, very long
+CONTINUATION_STEPS: tuple[int, ...] = (1, 3, 5, 10, 20)
 
 
 @dataclass
@@ -159,11 +165,20 @@ def fp_distance(lp_solution: Sequence[float], rounded: Sequence[float]) -> float
 
 
 def action_to_flip_count(action: int, n: int) -> int:
+    """Map a flip-bin action to an integer flip count.
+
+    Bin 0  → exactly 1 variable (the minimum meaningful perturbation).
+    Bin 1  → max(2, ceil(1%  * n))  — slide specifies min-2 for the 1% bin.
+    Bin 2+ → ceil(proportion * n),  minimum 1.
+    """
     action = int(np.clip(action, 0, len(ACTION_PROPORTIONS) - 1))
     proportion = ACTION_PROPORTIONS[action]
-    if proportion <= 0.0:
-        return 0
-    return max(1, int(math.ceil(proportion * max(1, n))))
+    if proportion is None:          # bin 0: exactly 1 variable
+        return 1
+    k = int(math.ceil(proportion * max(1, n)))
+    if action == 1:                 # 1% bin: minimum 2 flips
+        return max(2, k)
+    return max(1, k)
 
 
 class SPPFeasibilityPump:
