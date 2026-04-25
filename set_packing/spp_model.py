@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -18,7 +18,10 @@ class SPPInstance:
     path: str
     A: sparse.csr_matrix
     b: np.ndarray
-    profits: np.ndarray
+    profits: np.ndarray          # first objective vector (c[0]); kept for backward compat
+    c: list = field(default_factory=list)   # list of p np.ndarray objective vectors
+    d: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=float))  # shape (p,)
+    p: int = 1                   # number of objectives
 
     @property
     def m(self) -> int:
@@ -55,6 +58,7 @@ def _as_csr(A: np.ndarray | sparse.spmatrix) -> sparse.csr_matrix:
 
 
 def _parse_linear_terms(text: str) -> dict[int, float]:
+    """Parse x-variable terms only; returns {0-based col index: coef}."""
     one_line = re.sub(r"\s+", " ", text).strip()
     term_re = re.compile(r"([+-]?\s*\d*\.?\d*)\s*x(\d+)", re.IGNORECASE)
     terms: dict[int, float] = {}
@@ -71,7 +75,33 @@ def _parse_linear_terms(text: str) -> dict[int, float]:
     return terms
 
 
+def _parse_xy_terms(text: str) -> dict[str, float]:
+    """Parse x and y variable terms; returns {'x3': coef, 'y1': coef, ...}."""
+    one_line = re.sub(r"\s+", " ", text).strip()
+    term_re = re.compile(r"([+-]?\s*\d*\.?\d*)\s*([xy]\d+)", re.IGNORECASE)
+    out: dict[str, float] = {}
+    for coef_s, vname in term_re.findall(one_line):
+        token = coef_s.replace(" ", "")
+        if token in ("", "+"):
+            coef = 1.0
+        elif token == "-":
+            coef = -1.0
+        else:
+            coef = float(token)
+        key = vname.lower()
+        out[key] = out.get(key, 0.0) + coef
+    return out
+
+
 def load_spp_lp_instance(path: str | Path) -> SPPInstance:
+    """Load a set-packing LP instance.
+
+    Handles two formats:
+    - *Single-objective* (legacy): ``Maximize obj: x1 + x2 + ...`` with only
+      ``<=`` rows in Subject To.
+    - *Multi-objective*: ``Maximize obj: y1 + y2 + ...`` with both ``<=`` rows
+      (set-packing) and ``=`` rows of the form ``c_k x − y_k = −d_k``.
+    """
     lp_path = Path(path)
     text = lp_path.read_text(encoding="utf-8", errors="replace")
 
@@ -79,7 +109,9 @@ def load_spp_lp_instance(path: str | Path) -> SPPInstance:
     if not obj_match:
         raise ValueError(f"Could not find a Maximize or Minimize block in {lp_path}")
     objective_sense = obj_match.group(1).lower()
-    objective_terms = _parse_linear_terms(obj_match.group(2))
+    obj_raw = _parse_xy_terms(obj_match.group(2))
+    # Detect whether objective is over y variables (multi-obj) or x variables (single-obj)
+    is_multi_obj = any(k.startswith("y") for k in obj_raw)
 
     st_match = re.search(
         r"(?is)\bSubject\s+To\b(.*?)(?=^\s*(?:Binary|Binaries|Bounds|Generals|End)\b)",
@@ -89,43 +121,94 @@ def load_spp_lp_instance(path: str | Path) -> SPPInstance:
     if not st_match:
         raise ValueError(f"Could not find a Subject To block in {lp_path}")
 
-    rows: list[dict[int, float]] = []
-    rhs_values: list[float] = []
-    max_col = max(objective_terms.keys(), default=-1)
+    # Parse <= rows (Ax <= b) and = rows (c_k x - y_k = -d_k)
+    le_rows: list[dict[int, float]] = []
+    le_rhs: list[float] = []
+    eq_rows: dict[int, dict[int, float]] = {}   # k (0-based) -> {col: coef}
+    eq_d: dict[int, float] = {}                  # k -> d_k
+
     for raw_line in st_match.group(1).splitlines():
         line = raw_line.strip()
-        if not line or "<=" not in line:
+        if not line:
             continue
         if ":" in line:
             _, line = line.split(":", 1)
-        lhs, rhs_s = line.rsplit("<=", 1)
-        terms = _parse_linear_terms(lhs)
-        if not terms:
-            continue
-        max_col = max(max_col, max(terms.keys()))
-        rows.append(terms)
-        rhs_values.append(float(rhs_s.strip()))
+            line = line.strip()
+        if "<=" in line:
+            lhs, rhs_s = line.rsplit("<=", 1)
+            x_terms = _parse_linear_terms(lhs)
+            if x_terms:
+                le_rows.append(x_terms)
+                le_rhs.append(float(rhs_s.strip()))
+        elif "=" in line:
+            lhs, rhs_s = line.rsplit("=", 1)
+            mixed = _parse_xy_terms(lhs)
+            y_vars = {k: v for k, v in mixed.items() if k.startswith("y")}
+            x_vars = {}
+            for k, v in mixed.items():
+                m_x = re.match(r"^x(\d+)$", k)
+                if m_x:
+                    x_vars[int(m_x.group(1)) - 1] = v
+            if y_vars and x_vars:
+                for yname in y_vars:
+                    m_y = re.match(r"^y(\d+)$", yname)
+                    if m_y:
+                        ki = int(m_y.group(1)) - 1
+                        eq_rows[ki] = x_vars
+                        # constraint is c_k x - y_k = -d_k  =>  d_k = -rhs
+                        eq_d[ki] = -float(rhs_s.strip())
 
-    if not rows:
+    if not le_rows:
         raise ValueError(f"No Ax <= b rows were parsed from {lp_path}")
 
-    n = max_col + 1
-    r_idx: list[int] = []
-    c_idx: list[int] = []
-    data: list[float] = []
-    for i, row in enumerate(rows):
-        for j, value in row.items():
-            r_idx.append(i)
-            c_idx.append(j)
-            data.append(float(value))
-    A = sparse.coo_matrix((data, (r_idx, c_idx)), shape=(len(rows), n), dtype=float).tocsr()
-    b = np.asarray(rhs_values, dtype=float)
-    profits = np.ones(n, dtype=float)
-    for j, value in objective_terms.items():
-        if 0 <= j < n:
-            profits[j] = -float(value) if objective_sense == "minimize" else float(value)
+    # Determine n from all parsed column indices
+    all_cols: list[int] = []
+    for row in le_rows:
+        all_cols.extend(row.keys())
+    for row in eq_rows.values():
+        all_cols.extend(row.keys())
+    if not is_multi_obj:
+        x_obj_terms = {int(re.match(r"^x(\d+)$", k).group(1)) - 1: v
+                       for k, v in obj_raw.items() if re.match(r"^x(\d+)$", k)}
+        all_cols.extend(x_obj_terms.keys())
+    n = max(all_cols, default=0) + 1
 
-    return SPPInstance(lp_path.name, str(lp_path), A, b, profits)
+    # Build A (sparse) and b
+    r_idx, c_idx, vals = [], [], []
+    for i, row in enumerate(le_rows):
+        for j, v in row.items():
+            r_idx.append(i); c_idx.append(j); vals.append(float(v))
+    A = sparse.coo_matrix((vals, (r_idx, c_idx)), shape=(len(le_rows), n), dtype=float).tocsr()
+    b = np.asarray(le_rhs, dtype=float)
+
+    # Build objective arrays
+    if is_multi_obj and eq_rows:
+        num_obj = max(eq_rows.keys()) + 1
+        c_list: list[np.ndarray] = []
+        d_arr = np.zeros(num_obj, dtype=float)
+        for k in range(num_obj):
+            ck = np.zeros(n, dtype=float)
+            if k in eq_rows:
+                for j, v in eq_rows[k].items():
+                    if 0 <= j < n:
+                        ck[j] = v
+                d_arr[k] = eq_d.get(k, 0.0)
+            c_list.append(ck)
+        profits = c_list[0].copy()
+        p_val = num_obj
+    else:
+        # Single-objective: profits from objective line
+        profits = np.ones(n, dtype=float)
+        x_obj_terms = {int(re.match(r"^x(\d+)$", k).group(1)) - 1: v
+                       for k, v in obj_raw.items() if re.match(r"^x(\d+)$", k)}
+        for j, value in x_obj_terms.items():
+            if 0 <= j < n:
+                profits[j] = -float(value) if objective_sense == "minimize" else float(value)
+        c_list = [profits.copy()]
+        d_arr = np.zeros(1, dtype=float)
+        p_val = 1
+
+    return SPPInstance(lp_path.name, str(lp_path), A, b, profits, c=c_list, d=d_arr, p=p_val)
 
 
 def load_spp_npz_instance(path: str | Path) -> SPPInstance:
@@ -134,23 +217,46 @@ def load_spp_npz_instance(path: str | Path) -> SPPInstance:
         if "A" not in arc.files:
             raise KeyError(f"{npz_path} does not contain an A matrix")
         A = _as_csr(arc["A"])
+        n = int(A.shape[1])
         b = np.asarray(arc["b"], dtype=float).reshape(-1) if "b" in arc.files else np.ones(A.shape[0])
-        profits = np.ones(A.shape[1], dtype=float)
+
+        # Build full c list and d array
+        c_list: list[np.ndarray] = []
+        d_arr: np.ndarray = np.zeros(1, dtype=float)
         if "profits" in arc.files:
             profits = np.asarray(arc["profits"], dtype=float).reshape(-1)
+            c_list = [profits.copy()]
         elif "c" in arc.files:
-            c = np.asarray(arc["c"], dtype=float)
-            if c.ndim == 1:
-                profits = c.reshape(-1)
-            elif c.ndim == 2 and c.shape[1] == A.shape[1]:
-                profits = c[0].reshape(-1)
+            c_raw = np.asarray(arc["c"], dtype=float)
+            if c_raw.ndim == 1:
+                c_list = [c_raw.reshape(-1)]
+            elif c_raw.ndim == 2 and c_raw.shape[1] == n:
+                c_list = [c_raw[k].copy() for k in range(c_raw.shape[0])]
+            else:
+                c_list = [np.ones(n, dtype=float)]
+            if "d" in arc.files:
+                d_arr = np.asarray(arc["d"], dtype=float).reshape(-1)
+                # Pad / trim d to match number of objectives
+                if d_arr.shape[0] < len(c_list):
+                    d_arr = np.concatenate([d_arr, np.zeros(len(c_list) - d_arr.shape[0])])
+                elif d_arr.shape[0] > len(c_list):
+                    d_arr = d_arr[: len(c_list)]
+            else:
+                d_arr = np.zeros(len(c_list), dtype=float)
+        else:
+            c_list = [np.ones(n, dtype=float)]
+
+        profits = c_list[0]
+
     if b.shape[0] != A.shape[0]:
         raise ValueError(f"b has length {b.shape[0]}, but A has {A.shape[0]} rows in {npz_path}")
-    if profits.shape[0] != A.shape[1]:
-        raise ValueError(
-            f"profits has length {profits.shape[0]}, but A has {A.shape[1]} columns in {npz_path}"
-        )
-    return SPPInstance(npz_path.name, str(npz_path), A, b, profits)
+    if profits.shape[0] != n:
+        raise ValueError(f"profits has length {profits.shape[0]}, but A has {n} columns in {npz_path}")
+
+    return SPPInstance(
+        npz_path.name, str(npz_path), A, b, profits,
+        c=c_list, d=d_arr, p=len(c_list),
+    )
 
 
 def load_spp_instance(path: str | Path) -> SPPInstance:
@@ -204,7 +310,25 @@ def round_binary(values: Sequence[float], threshold: float = 0.5) -> np.ndarray:
 
 
 def objective_value(instance: SPPInstance, x: Sequence[float]) -> float:
-    return float(np.dot(instance.profits, np.asarray(x, dtype=float)))
+    """Scalarized objective: sum of all p individual objective values y_k = c_k·x + d_k."""
+    x_arr = np.asarray(x, dtype=float)
+    if instance.p > 1 and len(instance.c) == instance.p:
+        return float(sum(
+            float(np.dot(instance.c[k], x_arr)) + float(instance.d[k])
+            for k in range(instance.p)
+        ))
+    return float(np.dot(instance.profits, x_arr))
+
+
+def objective_values_per_obj(instance: SPPInstance, x: Sequence[float]) -> np.ndarray:
+    """Return a (p,) array of individual objective values y_k = c_k·x + d_k."""
+    x_arr = np.asarray(x, dtype=float)
+    if instance.p > 1 and len(instance.c) == instance.p:
+        return np.array([
+            float(np.dot(instance.c[k], x_arr)) + float(instance.d[k])
+            for k in range(instance.p)
+        ], dtype=float)
+    return np.array([float(np.dot(instance.profits, x_arr))], dtype=float)
 
 
 def feasibility_metrics(
@@ -291,6 +415,7 @@ def generate_random_set_packing_instance(
     n: int = 80,
     m: int | None = None,
     density: float = 0.04,
+    p: int = 1,
     seed: int = 0,
 ) -> SPPInstance:
     rng = np.random.default_rng(seed)
@@ -301,18 +426,30 @@ def generate_random_set_packing_instance(
     for i in range(m):
         if not A_dense[i].any():
             A_dense[i, int(rng.integers(0, n))] = 1.0
-    profits = rng.integers(1, 101, size=n).astype(float)
-    return SPPInstance(name=name, path="", A=sparse.csr_matrix(A_dense), b=np.ones(m), profits=profits)
+    # First objective: uniform profits; additional objectives: random integer weights
+    c_list: list[np.ndarray] = [rng.integers(1, 101, size=n).astype(float)]
+    for _ in range(p - 1):
+        c_list.append(rng.integers(1, 101, size=n).astype(float))
+    profits = c_list[0]
+    d_arr = np.zeros(p, dtype=float)
+    return SPPInstance(
+        name=name, path="",
+        A=sparse.csr_matrix(A_dense), b=np.ones(m),
+        profits=profits, c=c_list, d=d_arr, p=p,
+    )
 
 
 def save_npz_instance(instance: SPPInstance, path: str | Path) -> str:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    c_mat = np.stack(instance.c, axis=0).astype(float) if instance.c else instance.profits.reshape(1, -1)
     np.savez_compressed(
         out,
         A=instance.A.toarray().astype(np.int8),
         b=instance.b.astype(float),
         profits=instance.profits.astype(float),
+        c=c_mat,
+        d=instance.d.astype(float),
     )
     return str(out.resolve())
 

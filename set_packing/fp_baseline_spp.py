@@ -10,13 +10,14 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from spp_model import (
+from set_packing.spp_model import (
     DEFAULT_TOLERANCE,
     SPPInstance,
     feasibility_metrics,
     find_instance_files,
     load_spp_instance,
     objective_value,
+    objective_values_per_obj,
     repair_set_packing_solution,
     round_binary,
     validate_set_packing_instance,
@@ -42,6 +43,17 @@ class FPConfig:
     random_seed: int = 0
     baseline_action: int = 2
     stop_on_repaired_incumbent: bool = False
+    # Quality gate for repair-found incumbents.
+    # A repaired solution is only accepted as best_feasible if its objective
+    # exceeds  lp_obj * repair_quality_threshold.  Set to 0.0 to accept any
+    # feasible solution (old behaviour).  Set to e.g. 0.30 to require that
+    # the repaired solution is at least 30% of the LP optimal — this prevents
+    # the trivial "remove all conflicting variables" repair from short-circuiting
+    # the RL training signal on hard instances.
+    repair_quality_threshold: float = 0.0
+    # LP objective stored at reset time for quality-gate comparisons.
+    # Set automatically; do not configure manually.
+    _lp_obj: float = 0.0
     cplex_threads: int = 1
     verbose: bool = True
 
@@ -77,6 +89,7 @@ class CplexSolveResult:
     x: Optional[np.ndarray]
     message: str
     objective_value: Optional[float] = None
+    y: Optional[np.ndarray] = None   # per-objective values y_k (p,), when p > 1
 
 
 def _log(enabled: bool, msg: str) -> None:
@@ -127,13 +140,32 @@ def solve_lp_relaxation(
     if model is None:
         return CplexSolveResult(False, None, error)
     x = model.continuous_var_list(instance.n, lb=0.0, ub=1.0, name="x")
+    # Set-packing constraints Ax <= b
     for i in range(instance.m):
         model.add_constraint(
             model.sum(value * x[j] for j, value in _iter_csr_row(instance, i)) <= float(instance.b[i]),
             ctname=f"packing_{i}",
         )
-    model.maximize(model.sum(float(instance.profits[j]) * x[j] for j in range(instance.n)))
-    return _solve_docplex_model(model, x)
+    if instance.p > 1 and len(instance.c) == instance.p:
+        # Multi-objective: maximize sum(y_k) with y_k = c_k·x + d_k
+        y = model.continuous_var_list(instance.p, name="y")
+        for k in range(instance.p):
+            ck = instance.c[k]
+            model.add_constraint(
+                model.sum(float(ck[j]) * x[j] for j in range(instance.n) if ck[j] != 0.0)
+                + float(instance.d[k]) == y[k],
+                ctname=f"obj_y{k + 1}",
+            )
+        model.maximize(model.sum(y))
+        base = _solve_docplex_model(model, x)
+        if base.success:
+            y_vals = np.asarray([float(yv.solution_value) for yv in y], dtype=float)
+            return CplexSolveResult(True, base.x, base.message, base.objective_value, y=y_vals)
+        return base
+    else:
+        # Single-objective: maximize profits·x
+        model.maximize(model.sum(float(instance.profits[j]) * x[j] for j in range(instance.n)))
+        return _solve_docplex_model(model, x)
 
 
 def solve_distance_projection(
@@ -147,17 +179,33 @@ def solve_distance_projection(
     if model is None:
         return CplexSolveResult(False, None, error)
     z = model.continuous_var_list(instance.n, lb=0.0, ub=1.0, name="z")
+    # Set-packing constraints Az <= b
     for i in range(instance.m):
         model.add_constraint(
             model.sum(value * z[j] for j, value in _iter_csr_row(instance, i)) <= float(instance.b[i]),
             ctname=f"packing_{i}",
         )
+    # Add objective-image constraints when multi-objective (y_k = c_k·z + d_k)
+    y_vars = None
+    if instance.p > 1 and len(instance.c) == instance.p:
+        y_vars = model.continuous_var_list(instance.p, name="y")
+        for k in range(instance.p):
+            ck = instance.c[k]
+            model.add_constraint(
+                model.sum(float(ck[j]) * z[j] for j in range(instance.n) if ck[j] != 0.0)
+                + float(instance.d[k]) == y_vars[k],
+                ctname=f"obj_y{k + 1}",
+            )
     distance_objective = model.sum(
         z[j] if target[j] < 0.5 else (1.0 - z[j])
         for j in range(instance.n)
     )
     model.minimize(distance_objective)
-    return _solve_docplex_model(model, z)
+    base = _solve_docplex_model(model, z)
+    if base.success and y_vars is not None:
+        y_vals = np.asarray([float(yv.solution_value) for yv in y_vars], dtype=float)
+        return CplexSolveResult(True, base.x, base.message, base.objective_value, y=y_vals)
+    return base
 
 
 def fp_distance(lp_solution: Sequence[float], rounded: Sequence[float]) -> float:
@@ -198,6 +246,7 @@ class SPPFeasibilityPump:
 
         self.x_lp: Optional[np.ndarray] = None
         self.x_binary: Optional[np.ndarray] = None
+        self.y_values: Optional[np.ndarray] = None   # per-objective values (p,) from last LP/projection
         self.best_feasible: Optional[np.ndarray] = None
         self.best_feasible_objective = -math.inf
         self.best_distance = math.inf
@@ -228,6 +277,8 @@ class SPPFeasibilityPump:
         return feasibility_metrics(self.instance, self.x_binary, self.config.tolerance)
 
     def current_objective(self) -> float:
+        if self.instance.p > 1 and self.y_values is not None:
+            return float(np.sum(self.y_values))
         if self.x_binary is None:
             return 0.0
         return objective_value(self.instance, self.x_binary)
@@ -250,7 +301,14 @@ class SPPFeasibilityPump:
 
         self.x_lp = np.asarray(res.x, dtype=float)
         self.x_binary = round_binary(self.x_lp)
+        if res.y is not None:
+            self.y_values = res.y.copy()
         self.last_distance = self.current_distance()
+        # Cache LP objective for repair quality gate
+        if res.objective_value is not None:
+            self.config._lp_obj = float(res.objective_value)
+        else:
+            self.config._lp_obj = float(objective_value(self.instance, self.x_lp))
         self.best_distance = self.last_distance
         _log(
             self.config.verbose,
@@ -275,7 +333,14 @@ class SPPFeasibilityPump:
             )
         if metrics.is_feasible:
             obj = objective_value(self.instance, repaired)
-            if obj > self.best_feasible_objective + self.config.tolerance:
+            # Quality gate: only accept repair incumbent if it clears the threshold
+            # relative to the LP optimal.  This prevents the trivial "remove all
+            # conflicting variables" repair from masking the RL training signal on
+            # hard instances where the repair finds a near-empty (low-quality) solution.
+            lp_obj = self.config._lp_obj
+            threshold = self.config.repair_quality_threshold
+            quality_ok = (threshold <= 0.0) or (lp_obj <= 0.0) or (obj >= threshold * lp_obj)
+            if quality_ok and obj > self.best_feasible_objective + self.config.tolerance:
                 self.best_feasible = repaired.copy()
                 self.best_feasible_objective = obj
                 self.notes.append("repaired_incumbent")
@@ -355,6 +420,8 @@ class SPPFeasibilityPump:
             return StepOutcome(False, False, False, "projection_failed")
 
         self.x_lp = np.asarray(res.x, dtype=float)
+        if res.y is not None:
+            self.y_values = res.y.copy()
         new_binary = round_binary(self.x_lp)
         self.x_binary = new_binary
         self.iterations += 1

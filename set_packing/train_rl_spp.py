@@ -10,9 +10,9 @@ from typing import Sequence
 
 import numpy as np
 
-from fp_baseline_spp import FPConfig
-from spp_model import find_instance_files
-from spp_rl_env import SPPRLEnvConfig, SPPFeasibilityPumpEnv, heuristic_action_from_observation
+from set_packing.fp_baseline_spp import FPConfig
+from set_packing.spp_model import find_instance_files
+from set_packing.spp_rl_env import SPPRLEnvConfig, SPPFeasibilityPumpEnv, heuristic_action_from_observation
 
 
 AGGREGATE_LOG_FIELDS = [
@@ -53,6 +53,7 @@ def create_env(instance_paths: Sequence[str], args: argparse.Namespace) -> SPPFe
         random_seed=args.seed,
         cplex_threads=args.cplex_threads,
         verbose=args.verbose,
+        repair_quality_threshold=getattr(args, "repair_quality_threshold", 0.0),
     )
     env_cfg = SPPRLEnvConfig(
         instance_paths=list(instance_paths),
@@ -320,6 +321,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-limit", type=float, default=10.0)
     parser.add_argument("--stall-length", type=int, default=3)
     parser.add_argument("--cplex-threads", type=int, default=1)
+    parser.add_argument(
+        "--repair-quality-threshold", type=float, default=0.0,
+        help=(
+            "Only count a repair-heuristic solution as 'success' if its objective "
+            "is >= this fraction of the LP optimal. 0.0 = accept any feasible solution "
+            "(old behaviour). Recommended: 0.30 for hard random-dense instances so the "
+            "trivial greedy repair does not short-circuit the RL training signal."
+        ),
+    )
     # --continuation-steps removed: continuation depth is now action dim 1 (MultiDiscrete)
     parser.add_argument("--log-every-episodes", type=int, default=5)
     parser.add_argument("--rolling-window", type=int, default=20)

@@ -1,5 +1,5 @@
-from fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
-from mmp_fp_core import FPRunConfig
+from mmp.fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
+from mmp.mmp_fp_core import FPRunConfig
 
 instance_paths = [
     "instances_n3000/instance_1.npz",

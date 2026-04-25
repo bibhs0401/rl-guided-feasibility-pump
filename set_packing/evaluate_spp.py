@@ -7,9 +7,9 @@ import random
 from pathlib import Path
 from typing import Any, Sequence
 
-from fp_baseline_spp import FPConfig, FPResult, run_baseline_fp, write_results_csv
-from spp_model import find_instance_files, load_spp_instance
-from spp_rl_env import SPPRLEnvConfig, SPPFeasibilityPumpEnv, heuristic_action_from_observation
+from set_packing.fp_baseline_spp import FPConfig, FPResult, run_baseline_fp, write_results_csv
+from set_packing.spp_model import find_instance_files, load_spp_instance
+from set_packing.spp_rl_env import SPPRLEnvConfig, SPPFeasibilityPumpEnv, heuristic_action_from_observation
 
 
 SUMMARY_COLUMNS = [

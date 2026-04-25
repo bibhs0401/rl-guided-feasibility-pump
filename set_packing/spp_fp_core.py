@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -20,10 +20,13 @@ class SPPProblemInstance:
     instance_path: str
     A: sparse.csr_matrix
     b: np.ndarray
-    profits: np.ndarray
+    profits: np.ndarray          # = c[0] for backward compat
     m: int
     n: int
     integer_indices: list[int]
+    c: list = field(default_factory=list)   # list of p np.ndarray objective vectors
+    d: np.ndarray = field(default_factory=lambda: np.zeros(1, dtype=float))  # shape (p,)
+    p: int = 1                              # number of objectives
 
 
 @dataclass
@@ -63,58 +66,98 @@ def load_spp_lp_instance(instance_path: str | Path) -> SPPProblemInstance:
     path = Path(instance_path)
     text = path.read_text(encoding="utf-8", errors="replace")
 
-    obj_match = re.search(r"(?is)Maximize\s*(.*?)\s*Subject To", text)
+    obj_match = re.search(r"(?is)\b(Maximize|Minimize)\b(.*?)\bSubject\s+To\b", text)
     if not obj_match:
         raise ValueError(f"Could not parse objective from {path}")
-    obj_terms = _parse_objective_terms(obj_match.group(1))
+    obj_raw_text = obj_match.group(2)
 
-    st_match = re.search(r"(?is)Subject To\s*(.*?)(?=^\s*(?:Binary|Bounds|End)\s*$)", text, re.MULTILINE)
+    # Detect multi-obj (y variables in objective) vs single-obj (x variables)
+    has_y_obj = bool(re.search(r"\by\d+\b", obj_raw_text, re.IGNORECASE))
+
+    st_match = re.search(
+        r"(?is)\bSubject\s+To\b(.*?)(?=^\s*(?:Binary|Binaries|Bounds|Generals|End)\b)",
+        text, re.MULTILINE,
+    )
     if not st_match:
         raise ValueError(f"Could not parse Subject To block from {path}")
     st_body = st_match.group(1)
 
-    rows: list[list[int]] = []
-    rhs_vals: list[float] = []
-    max_x = max(obj_terms.keys(), default=-1) + 1
+    le_rows_cols: list[list[int]] = []
+    le_rhs: list[float] = []
+    eq_rows: dict[int, dict[int, float]] = {}   # k -> {col: coef}
+    eq_d: dict[int, float] = {}                  # k -> d_k
+
     for raw in st_body.splitlines():
         line = raw.strip()
-        if not line or ":" not in line or "<=" not in line:
+        if not line:
             continue
-        _, body = line.split(":", 1)
-        lhs, rhs_s = body.rsplit("<=", 1)
-        rhs_vals.append(float(rhs_s.strip()))
-        cols = [int(v) - 1 for v in re.findall(r"x(\d+)", lhs, flags=re.IGNORECASE)]
-        if cols:
-            max_x = max(max_x, max(cols) + 1)
-        rows.append(cols)
+        if ":" in line:
+            _, line = line.split(":", 1)
+            line = line.strip()
+        if "<=" in line:
+            lhs, rhs_s = line.rsplit("<=", 1)
+            cols = [int(v) - 1 for v in re.findall(r"x(\d+)", lhs, re.IGNORECASE)]
+            le_rows_cols.append(cols)
+            le_rhs.append(float(rhs_s.strip()))
+        elif "=" in line:
+            lhs, rhs_s = line.rsplit("=", 1)
+            y_m = re.findall(r"([+-]?\s*\d*\.?\d*)\s*y(\d+)", lhs, re.IGNORECASE)
+            if y_m:
+                ki = int(y_m[0][1]) - 1
+                x_terms: dict[int, float] = {}
+                for coef_s, xidx_s in re.findall(
+                    r"([+-]?\s*\d*\.?\d*)\s*x(\d+)", lhs, re.IGNORECASE
+                ):
+                    tok = coef_s.replace(" ", "")
+                    coef = 1.0 if tok in ("", "+") else (-1.0 if tok == "-" else float(tok))
+                    x_terms[int(xidx_s) - 1] = coef
+                eq_rows[ki] = x_terms
+                eq_d[ki] = -float(rhs_s.strip())
 
-    if max_x <= 0:
-        raise ValueError(f"No variables found in {path}")
+    all_cols: list[int] = [j for cols in le_rows_cols for j in cols]
+    for row in eq_rows.values():
+        all_cols.extend(row.keys())
+    if not has_y_obj:
+        all_cols.extend(int(v) - 1 for v in re.findall(r"x(\d+)", obj_raw_text, re.IGNORECASE))
+    n = max(all_cols, default=0) + 1
+    m = len(le_rows_cols)
 
-    m = len(rows)
-    n = max_x
-    data, r_idx, c_idx = [], [], []
-    for i, cols in enumerate(rows):
+    data_v, r_idx, c_idx_v = [], [], []
+    for i, cols in enumerate(le_rows_cols):
         for j in cols:
-            data.append(1.0)
-            r_idx.append(i)
-            c_idx.append(j)
-    A = sparse.coo_matrix((data, (r_idx, c_idx)), shape=(m, n), dtype=float).tocsr()
-    b = np.asarray(rhs_vals, dtype=float)
+            data_v.append(1.0); r_idx.append(i); c_idx_v.append(j)
+    A = sparse.coo_matrix((data_v, (r_idx, c_idx_v)), shape=(m, n), dtype=float).tocsr()
+    b = np.asarray(le_rhs, dtype=float)
 
-    profits = np.ones(n, dtype=float)
-    for j, c in obj_terms.items():
-        if 0 <= j < n:
-            profits[j] = c
+    if has_y_obj and eq_rows:
+        num_obj = max(eq_rows.keys()) + 1
+        c_list: list[np.ndarray] = []
+        d_arr = np.zeros(num_obj, dtype=float)
+        for k in range(num_obj):
+            ck = np.zeros(n, dtype=float)
+            if k in eq_rows:
+                for j, v in eq_rows[k].items():
+                    if 0 <= j < n:
+                        ck[j] = v
+                d_arr[k] = eq_d.get(k, 0.0)
+            c_list.append(ck)
+        profits = c_list[0].copy()
+        p_val = num_obj
+    else:
+        profits = np.ones(n, dtype=float)
+        obj_terms = _parse_objective_terms(obj_raw_text)
+        for j, cv in obj_terms.items():
+            if 0 <= j < n:
+                profits[j] = cv
+        c_list = [profits.copy()]
+        d_arr = np.zeros(1, dtype=float)
+        p_val = 1
 
     return SPPProblemInstance(
         instance_path=str(path),
-        A=A,
-        b=b,
-        profits=profits,
-        m=m,
-        n=n,
+        A=A, b=b, profits=profits, m=m, n=n,
         integer_indices=list(range(n)),
+        c=c_list, d=d_arr, p=p_val,
     )
 
 
@@ -126,19 +169,38 @@ def load_spp_npz_instance(instance_path: str | Path) -> SPPProblemInstance:
     A = sparse.csr_matrix(np.asarray(arc["A"], dtype=float))
     b = np.asarray(arc["b"], dtype=float).reshape(-1)
     n = int(A.shape[1])
-    profits = np.ones(n, dtype=float)
-    if "c" in arc.files:
-        c = np.asarray(arc["c"], dtype=float)
-        if c.ndim == 2 and c.shape[1] == n:
-            profits = c[0].copy()
+
+    c_list: list[np.ndarray] = []
+    d_arr = np.zeros(1, dtype=float)
+    if "profits" in arc.files:
+        profits = np.asarray(arc["profits"], dtype=float).reshape(-1)
+        c_list = [profits.copy()]
+    elif "c" in arc.files:
+        c_raw = np.asarray(arc["c"], dtype=float)
+        if c_raw.ndim == 1:
+            c_list = [c_raw.reshape(-1)]
+        elif c_raw.ndim == 2 and c_raw.shape[1] == n:
+            c_list = [c_raw[k].copy() for k in range(c_raw.shape[0])]
+        else:
+            c_list = [np.ones(n, dtype=float)]
+        if "d" in arc.files:
+            d_raw = np.asarray(arc["d"], dtype=float).reshape(-1)
+            if d_raw.shape[0] < len(c_list):
+                d_arr = np.concatenate([d_raw, np.zeros(len(c_list) - d_raw.shape[0])])
+            else:
+                d_arr = d_raw[: len(c_list)]
+        else:
+            d_arr = np.zeros(len(c_list), dtype=float)
+    else:
+        c_list = [np.ones(n, dtype=float)]
+
+    profits = c_list[0]
     return SPPProblemInstance(
         instance_path=str(path),
-        A=A,
-        b=b,
-        profits=profits,
-        m=int(A.shape[0]),
-        n=n,
+        A=A, b=b, profits=profits,
+        m=int(A.shape[0]), n=n,
         integer_indices=list(range(n)),
+        c=c_list, d=d_arr, p=len(c_list),
     )
 
 
@@ -203,7 +265,11 @@ class SetPackingFPCore:
 
         self.x_relaxed: Optional[list[float]] = None
         self.x_rounded: Optional[list[float]] = None
+        self.y_values: Optional[list[float]] = None   # per-objective values (p,)
         self._cached_lp_result = None
+        # Placeholders set by build_models(); kept here for type-checker clarity
+        self.relaxation_y = None
+        self.distance_y = None
 
     def remaining_time(self) -> Optional[float]:
         if self.start_time is None:
@@ -222,7 +288,19 @@ class SetPackingFPCore:
         x = rm.continuous_var_list(self.problem.n, lb=0.0, ub=1.0, name="x")
         for i in range(self.problem.m):
             rm.add_constraint(rm.sum(v * x[j] for j, v in _iter_csr_row(self.problem.A, i)) <= float(self.problem.b[i]))
-        rm.maximize(rm.sum(float(self.problem.profits[j]) * x[j] for j in range(self.problem.n)))
+        if self.problem.p > 1 and len(self.problem.c) == self.problem.p:
+            ry = rm.continuous_var_list(self.problem.p, name="y")
+            for k in range(self.problem.p):
+                ck = self.problem.c[k]
+                rm.add_constraint(
+                    rm.sum(float(ck[j]) * x[j] for j in range(self.problem.n) if ck[j] != 0.0)
+                    + float(self.problem.d[k]) == ry[k]
+                )
+            rm.maximize(rm.sum(ry))
+            self.relaxation_y = ry
+        else:
+            rm.maximize(rm.sum(float(self.problem.profits[j]) * x[j] for j in range(self.problem.n)))
+            self.relaxation_y = None
         self.relaxation_model, self.relaxation_x = rm, x
         self.relaxation_build_seconds = time.time() - t0
 
@@ -232,6 +310,17 @@ class SetPackingFPCore:
         z = dm.continuous_var_list(self.problem.n, lb=0.0, ub=1.0, name="z")
         for i in range(self.problem.m):
             dm.add_constraint(dm.sum(v * z[j] for j, v in _iter_csr_row(self.problem.A, i)) <= float(self.problem.b[i]))
+        if self.problem.p > 1 and len(self.problem.c) == self.problem.p:
+            dy = dm.continuous_var_list(self.problem.p, name="y")
+            for k in range(self.problem.p):
+                ck = self.problem.c[k]
+                dm.add_constraint(
+                    dm.sum(float(ck[j]) * z[j] for j in range(self.problem.n) if ck[j] != 0.0)
+                    + float(self.problem.d[k]) == dy[k]
+                )
+            self.distance_y = dy
+        else:
+            self.distance_y = None
         self.distance_model, self.distance_z = dm, z
         self.distance_build_seconds = time.time() - t0
 
@@ -244,7 +333,11 @@ class SetPackingFPCore:
             self._cached_lp_result = None
             return
         x_relaxed = [float(sol.get_value(self.relaxation_x[j])) for j in range(self.problem.n)]
-        self._cached_lp_result = (x_relaxed, float(self.relaxation_model.objective_value))
+        y_relaxed = (
+            [float(sol.get_value(self.relaxation_y[k])) for k in range(self.problem.p)]
+            if self.relaxation_y is not None else None
+        )
+        self._cached_lp_result = (x_relaxed, float(self.relaxation_model.objective_value), y_relaxed)
 
     def reset_state(self) -> None:
         t0 = time.time()
@@ -271,9 +364,12 @@ class SetPackingFPCore:
             self.reset_seconds = time.time() - t0
             return
 
-        x_relaxed, obj = self._cached_lp_result
+        cached = self._cached_lp_result
+        x_relaxed, obj = cached[0], cached[1]
+        y_relaxed = cached[2] if len(cached) > 2 else None
         self.x_relaxed = list(x_relaxed)
         self.initial_lp_objective = float(obj)
+        self.y_values = list(y_relaxed) if y_relaxed is not None else None
         self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
         self.initial_distance = fp_distance(self.x_relaxed, self.x_rounded, self.problem.integer_indices)
         self.initial_solution_was_integer = is_integer_solution(self.x_relaxed, self.problem.integer_indices)
@@ -349,6 +445,8 @@ class SetPackingFPCore:
 
         prev = list(self.x_rounded)
         self.x_relaxed = [float(sol.get_value(self.distance_z[j])) for j in range(self.problem.n)]
+        if self.distance_y is not None:
+            self.y_values = [float(sol.get_value(self.distance_y[k])) for k in range(self.problem.p)]
         if is_integer_solution(self.x_relaxed, self.problem.integer_indices):
             self.x_rounded = round_integer_values(self.x_relaxed, self.problem.integer_indices)
             self.integer_found = True

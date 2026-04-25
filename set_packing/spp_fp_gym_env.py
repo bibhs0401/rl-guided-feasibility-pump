@@ -10,7 +10,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from spp_fp_core import (
+from set_packing.spp_fp_core import (
     SPFPRunConfig,
     SPPProblemInstance,
     SetPackingFPCore,
@@ -211,7 +211,8 @@ class SetPackingFPRLEnv(gym.Env):
         if self.runner.x_relaxed is not None:
             non_integral = sum(abs(self.runner.x_relaxed[idx] - round(self.runner.x_relaxed[idx])) > 1e-6 for idx in self.problem.integer_indices)
             unfixed_fraction = non_integral / n_integer
-        p_norm = 1.0 / 5.0
+        # Encode number of objectives; paper uses p in {3,4,5}, normalise to [0,1]
+        p_norm = min(1.0, self.problem.n_objectives / 5.0) if hasattr(self.problem, "n_objectives") else min(1.0, self.problem.p / 5.0)
         return np.array(
             [
                 float(np.clip(binary_fraction, 0.0, 1.0)),
@@ -233,8 +234,14 @@ class SetPackingFPRLEnv(gym.Env):
         }
 
     def _current_integer_objective(self) -> float:
-        if self.runner is None or self.problem is None or self.runner.x_rounded is None:
+        if self.runner is None or self.problem is None:
             return 0.0
+        # Use tracked y_values (sum of objectives) when available
+        if self.runner.y_values is not None and self.problem.p > 1:
+            return float(sum(self.runner.y_values))
+        if self.runner.x_rounded is None:
+            return 0.0
+        # Fall back to profits·x for single-objective or when y unavailable
         return float(
             sum(
                 float(self.problem.profits[j]) * float(self.runner.x_rounded[j])
@@ -287,7 +294,7 @@ class SetPackingFPRLEnv(gym.Env):
             "instance_name": Path(self.problem.instance_path).name,
             "m": self.problem.m,
             "n": self.problem.n,
-            "p": 1,
+            "p": self.problem.p,
             "failed": self.runner.failed,
             "integer_found": self.runner.integer_found,
             "terminated_in_initial_relaxation": self.runner.terminated_in_initial_relaxation,
@@ -316,7 +323,7 @@ class SetPackingFPRLEnv(gym.Env):
                 ),
                 "m": self.problem.m if self.problem is not None else 0,
                 "n": self.problem.n if self.problem is not None else 0,
-                "p": 1,
+                "p": self.problem.p if self.problem is not None else 1,
                 "failed": self.runner.failed if self.runner is not None else True,
                 "terminated_in_initial_relaxation": (
                     self.runner.terminated_in_initial_relaxation
@@ -390,7 +397,7 @@ class SetPackingFPRLEnv(gym.Env):
             "instance_name": Path(self.problem.instance_path).name,
             "m": self.problem.m,
             "n": self.problem.n,
-            "p": 1,
+            "p": self.problem.p,
             "flip_bin": flip_bin,
             "flip_count": flip_count,
             "continuation_bin": cont_bin,

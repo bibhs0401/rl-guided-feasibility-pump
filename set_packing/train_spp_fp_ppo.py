@@ -16,8 +16,8 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
-from spp_fp_core import SPFPRunConfig, load_spp_instance
-from spp_fp_gym_env import SPPGymConfig, SetPackingFPRLEnv
+from set_packing.spp_fp_core import SPFPRunConfig, load_spp_instance
+from set_packing.spp_fp_gym_env import SPPGymConfig, SetPackingFPRLEnv
 
 
 def read_instance_list(file_path: str) -> List[str]:

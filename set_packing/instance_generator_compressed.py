@@ -81,21 +81,57 @@ def write_compressed(idx: int, out_dir: str, n_value: int, m_value: int | None, 
     A_mat, b, c_mat, d, BigM = data(m, n, p)
     out_path = os.path.join(out_dir, f"matrices{idx}.npz")
     np.savez_compressed(out_path, A=A_mat, b=b, c=c_mat, d=d, BigM=BigM, m=m, n=n, p=p)
-    return A_mat, out_path
+    return A_mat, c_mat, d, out_path
 
 
-def write_set_packing_lp(A_mat: np.ndarray, out_path: str):
-    """LP export layer only; generation logic remains unchanged."""
+def write_set_packing_lp(A_mat: np.ndarray, c_mat: np.ndarray, d: np.ndarray, out_path: str):
+    """Write a multi-objective set-packing LP in CPLEX LP format.
+
+    Formulation:
+        maximize   y1 + y2 + ... + yp
+        subject to
+            (A x)_i <= 1            for i = 1..m  (set-packing rows, b=1)
+            c_k x - y_k  = -d_k    for k = 1..p  (objective-image rows)
+            x_j in {0,1}           for j = 1..n
+            y_k free               for k = 1..p
+    """
     m, n = A_mat.shape
+    p = int(c_mat.shape[0])
+    d_arr = np.asarray(d, dtype=float)
+
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(f"\\ Set Packing from legacy generator: m={m}, n={n}\n")
+        f.write(f"\\ Multi-Objective Set Packing: m={m}, n={n}, p={p}\n")
         f.write("Maximize\n")
-        f.write(" obj: " + " + ".join(f"x{j + 1}" for j in range(n)) + "\n\n")
+        f.write(" obj: " + " + ".join(f"y{k + 1}" for k in range(p)) + "\n\n")
         f.write("Subject To\n")
+
+        # Set-packing constraints: A x <= 1
         for i in range(m):
             nz_cols = np.where(A_mat[i] == 1)[0]
-            lhs = " + ".join(f"x{j + 1}" for j in nz_cols)
+            lhs = " + ".join(f"x{j + 1}" for j in nz_cols) if nz_cols.size > 0 else "0 x1"
             f.write(f" c{i + 1}: {lhs} <= 1\n")
+
+        # Objective-image constraints: c_k x - y_k = -d_k
+        for k in range(p):
+            parts = []
+            for j in range(n):
+                v = int(c_mat[k, j])
+                if v == 0:
+                    continue
+                if not parts:
+                    parts.append(f"{v} x{j + 1}" if v > 0 else f"- {-v} x{j + 1}")
+                else:
+                    parts.append(f"+ {v} x{j + 1}" if v > 0 else f"- {-v} x{j + 1}")
+            lhs = " ".join(parts) if parts else "0 x1"
+            rhs = f"{-float(d_arr[k]):.10g}"
+            f.write(f" obj_y{k + 1}: {lhs} - y{k + 1} = {rhs}\n")
+
+        # y variables are free (unbounded)
+        f.write("\nBounds\n")
+        for k in range(p):
+            f.write(f" y{k + 1} free\n")
+
+        # All x variables are binary
         f.write("\nBinary\n")
         per_line = 12
         for start in range(0, n, per_line):
@@ -135,7 +171,7 @@ def main():
     np.random.seed(args.seed)
 
     for j in range(1, args.num_instances + 1):
-        A_mat, npz_path = write_compressed(
+        A_mat, c_mat, d, npz_path = write_compressed(
             j,
             args.out_dir,
             n_value=args.n,
@@ -143,7 +179,7 @@ def main():
             p_value=args.p,
         )
         lp_path = os.path.join(args.out_dir, f"set_packing_{j}.lp")
-        write_set_packing_lp(A_mat, lp_path)
+        write_set_packing_lp(A_mat, c_mat, d, lp_path)
         if not args.write_npz and os.path.exists(npz_path):
             os.remove(npz_path)
         print(f"[{j}/{args.num_instances}] wrote {lp_path}")

@@ -28,7 +28,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from mmp_fp_core import (
+from mmp.mmp_fp_core import (
     FPRunConfig,
     FeasibilityPumpCore,
     ProblemInstance,

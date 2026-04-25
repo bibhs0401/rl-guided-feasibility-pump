@@ -11,17 +11,18 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from fp_baseline_spp import (
+from set_packing.fp_baseline_spp import (
     ACTION_PROPORTIONS,
     CONTINUATION_STEPS,
     FPConfig,
     SPPFeasibilityPump,
 )
-from spp_model import (
+from set_packing.spp_model import (
     SPPInstance,
     feasibility_metrics,
     load_spp_instance,
     objective_value,
+    objective_values_per_obj,
 )
 
 # ---------------------------------------------------------------------------
@@ -145,6 +146,7 @@ class SPPFeasibilityPumpEnv(gym.Env):
             random_seed=int(self.rng.integers(0, 2**31 - 1)),
             baseline_action=self.config.fp_config.baseline_action,
             stop_on_repaired_incumbent=False,
+            repair_quality_threshold=self.config.fp_config.repair_quality_threshold,
             cplex_threads=self.config.fp_config.cplex_threads,
             verbose=self.config.fp_config.verbose,
         )
@@ -211,7 +213,8 @@ class SPPFeasibilityPumpEnv(gym.Env):
 
         nnz       = p.A.nnz
         sparsity  = 1.0 - min(1.0, nnz / max(1, p.m * p.n))   # 1 = fully sparse
-        p_norm    = 1.0 / 3.0                                   # p=1 for SPP
+        # Encode number of objectives: paper uses p in {3,4,5}; normalise to [0,1]
+        p_norm    = min(1.0, p.p / 5.0)
 
         self._inst = np.asarray([
             binary_fraction,
@@ -467,7 +470,7 @@ class SPPFeasibilityPumpEnv(gym.Env):
             r_best = 0.0
 
         # +50: feasible solution found
-        feasible = bool(self.runner.result("rl_guided_fp").success)
+        feasible = bool(self.runner.result("rl_guided_fp", average_return=self.episode_return).success)
         r_feasible = rc.feasible_bonus if feasible else 0.0
 
         # -r_time: time consumed in this window

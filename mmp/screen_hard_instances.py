@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import List
 
-from mmp_fp_core import FPRunConfig, run_single_fp_episode
+from mmp.mmp_fp_core import FPRunConfig, run_single_fp_episode
 
 
 def infer_shape_tag(rows: list[dict]) -> str:

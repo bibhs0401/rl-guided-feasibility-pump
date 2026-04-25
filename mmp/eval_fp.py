@@ -30,8 +30,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
-from mmp_fp_core import FPRunConfig
+from mmp.fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
+from mmp.mmp_fp_core import FPRunConfig
 
 
 # -----------------------------------------------------------------------------

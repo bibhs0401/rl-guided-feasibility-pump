@@ -18,8 +18,8 @@ from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 
-from fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
-from mmp_fp_core import FPRunConfig
+from mmp.fp_gym_env import FeasibilityPumpRLEnv, FPGymConfig
+from mmp.mmp_fp_core import FPRunConfig
 
 
 # ---------------------------------------------------------------------------
