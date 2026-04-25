@@ -11,7 +11,6 @@ from scipy import sparse
 
 DEFAULT_TOLERANCE = 1e-6
 
-
 @dataclass
 class SPPInstance:
     name: str
